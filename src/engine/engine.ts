@@ -400,6 +400,21 @@ export class Engine {
       meta: this.metas,
       indexes: this.indexes,
     };
+    ctx.subquery = {
+      run: async (sub: SelectStmt): Promise<import("../expr/evaluator.js").SubqueryRow[]> => {
+        const subPlanner = new Planner({ tables });
+        const subPlan = subPlanner.planSelect(sub);
+        const subRoot = buildOperator(subPlan, ctx);
+        const rows: import("../expr/evaluator.js").SubqueryRow[] = [];
+        for (;;) {
+          const r = await subRoot.next();
+          if (!r) break;
+          rows.push({ values: r.values, schema: r.schema });
+        }
+        await subRoot.close();
+        return rows;
+      },
+    };
 
     if (opts.explain) {
       const { planToString } = await import("../planner/plan.js");

@@ -121,6 +121,34 @@ describe("JOINs", () => {
     const r = await q("SELECT users.name, orders.total FROM users LEFT JOIN orders ON users.id = orders.user_id ORDER BY users.id");
     expect(r.rowCount).toBe(4);
     expect(r.rows[2]).toEqual(["carol", null]);
+    expect(r.rows[3]).toEqual(["alice", null]);
+  });
+
+  it("right join", async () => {
+    await q("INSERT INTO orders (user_id, total) VALUES (99, 7.0)");
+    const r = await q("SELECT users.name, orders.total FROM users RIGHT JOIN orders ON users.id = orders.user_id ORDER BY orders.total");
+    expect(r.rowCount).toBe(3);
+    expect(r.rows[0]).toEqual([null, 7]);
+    expect(r.rows[1]).toEqual(["bob", 42]);
+    expect(r.rows[2]).toEqual(["alice", 99.5]);
+  });
+});
+
+describe("subqueries", () => {
+  it("IN (subquery) and NOT IN", async () => {
+    const r = await q("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders) ORDER BY id");
+    expect(r.rows).toEqual([["alice"], ["bob"]]);
+    const r2 = await q("SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders) ORDER BY id");
+    expect(r2.rows).toEqual([["carol"], ["alice"]]);
+  });
+
+  it("EXISTS / NOT EXISTS", async () => {
+    const r = await q("SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders) ORDER BY id");
+    expect(r.rowCount).toBe(4);
+    const r2 = await q("SELECT name FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE total > 1000) ORDER BY id");
+    expect(r2.rowCount).toBe(4);
+    const r3 = await q("SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > 1000)");
+    expect(r3.rowCount).toBe(0);
   });
 });
 

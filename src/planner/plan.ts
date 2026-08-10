@@ -33,7 +33,7 @@ export interface ProjectNode extends PlanNode {
 
 export interface JoinNode extends PlanNode {
   kind: "join";
-  joinType: "inner" | "left" | "cross";
+  joinType: "inner" | "left" | "right" | "cross";
   on: Expr | null;
   children: [PlanNode, PlanNode];
 }

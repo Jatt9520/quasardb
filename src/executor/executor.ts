@@ -3,7 +3,7 @@ import { BtreeIndex } from "../btree/btree.js";
 import { Expr } from "../sql/ast.js";
 import { TableHeap } from "../storage/tableHeap.js";
 import { Value, compareValues, truthy, valueHashKey } from "../expr/value.js";
-import { evalExpr } from "../expr/evaluator.js";
+import { containsSubquery, evalExpr, evalExprAsync, SubqueryRunner } from "../expr/evaluator.js";
 import { TableMeta } from "../storage/catalog.js";
 import { deserializeRow, Schema, schemaOf } from "../storage/record.js";
 import { AggregateNode, DistinctNode, FilterNode, JoinNode, LimitNode, PlanNode, ProjectNode, SortNode, TableScanNode } from "../planner/plan.js";
@@ -76,6 +76,7 @@ export interface ExecContext {
   heaps: Map<string, TableHeap>;
   meta: Map<string, TableMeta>;
   indexes: Map<string, BtreeIndex[]>;
+  subquery?: SubqueryRunner;
   emitProgress?: (label: string, rowCount: number) => void;
 }
 
@@ -122,6 +123,7 @@ export class FilterOperator extends BaseOperator {
   constructor(
     private child: Operator,
     private expr: Expr,
+    private ctx: ExecContext,
   ) {
     super();
   }
@@ -130,16 +132,26 @@ export class FilterOperator extends BaseOperator {
     for (;;) {
       const row = await this.child.next();
       if (!row) return null;
-      const v = evalExpr(this.expr, rowContext(row));
+      const v = await evalFilterExpr(this.expr, row, this.ctx);
       if (truthy(v)) return row;
     }
   }
+}
+
+/** Eval an expression on a row, using the async subquery path when needed. */
+function evalFilterExpr(expr: Expr, row: Row, ctx: ExecContext): Promise<Value> | Value {
+  if (containsSubquery(expr)) {
+    if (!ctx.subquery) throw new Error("Subquery execution is not available in this context");
+    return evalExprAsync(expr, rowContext(row), ctx.subquery);
+  }
+  return evalExpr(expr, rowContext(row));
 }
 
 export class ProjectOperator extends BaseOperator {
   constructor(
     private child: Operator,
     private node: ProjectNode,
+    private ctx: ExecContext,
   ) {
     super();
   }
@@ -160,7 +172,7 @@ export class ProjectOperator extends BaseOperator {
         }
         continue;
       }
-      const v = evalExpr(item.expr, rowContext(row));
+      const v = await evalFilterExpr(item.expr, row, this.ctx);
       values.push(v);
       names.push(item.out ?? "");
       tables.push("");
@@ -175,6 +187,7 @@ export class NestedLoopJoinOperator extends BaseOperator {
     private right: Operator,
     private on: Expr | null,
     private joinType: JoinNode["joinType"],
+    private ctx: ExecContext,
   ) {
     super();
   }
@@ -183,6 +196,13 @@ export class NestedLoopJoinOperator extends BaseOperator {
   private rightRows: Row[] | null = null;
   private rightIdx = 0;
   private leftMatched = false;
+  /** right join: set of right row indices already matched */
+  private matchedRight: Set<number> | null = null;
+  /** right join: phase 2 emits unmatched right rows */
+  private rightPhase = false;
+  private emitIdx = 0;
+  private leftSchema: string[] = [];
+  private leftTables: string[] = [];
 
   async nextInner(): Promise<Row | null> {
     if (this.rightRows === null) {
@@ -192,14 +212,17 @@ export class NestedLoopJoinOperator extends BaseOperator {
         if (!r) break;
         this.rightRows.push(r);
       }
+      if (this.joinType === "right") {
+        this.matchedRight = new Set();
+        this.leftSchema = [];
+        this.leftTables = [];
+      }
     }
+    if (this.joinType === "right") return this.nextRightJoin();
     for (;;) {
       if (!this.leftRow) {
         this.leftRow = await this.left.next();
         if (!this.leftRow) {
-          if (this.joinType === "left") {
-            // unmatched left rows already emitted inside the loop
-          }
           return null;
         }
         this.rightIdx = 0;
@@ -228,12 +251,63 @@ export class NestedLoopJoinOperator extends BaseOperator {
       const names = [...this.leftRow.schema, ...right.schema];
       const tabs = [...this.leftRow.tables, ...right.tables];
       if (this.on) {
-        const v = evalExpr(this.on, rowContext(makeRow(values, names, tabs)));
+        const v = await evalFilterExpr(this.on, makeRow(values, names, tabs), this.ctx);
         if (truthy(v)) {
           this.leftMatched = true;
           return makeRow(values, names, tabs);
         }
       } else {
+        return makeRow(values, names, tabs);
+      }
+    }
+  }
+
+  private async nextRightJoin(): Promise<Row | null> {
+    for (;;) {
+      if (this.rightPhase) {
+        if (this.emitIdx >= this.rightRows!.length) return null;
+        const r = this.rightRows![this.emitIdx++];
+        if (this.matchedRight!.has(this.emitIdx - 1)) continue;
+        const values: Value[] = [...this.leftSchema.map(() => null), ...r.values];
+        const names = [...this.leftSchema, ...r.schema];
+        const tabs = [...this.leftTables, ...r.tables];
+        return makeRow(values, names, tabs);
+      }
+      if (!this.leftRow) {
+        this.leftRow = await this.left.next();
+        if (!this.leftRow) {
+          this.rightPhase = true;
+          this.emitIdx = 0;
+          continue;
+        }
+        if (this.leftSchema.length === 0) {
+          this.leftSchema = this.leftRow.schema;
+          this.leftTables = this.leftRow.tables;
+        }
+        this.rightIdx = 0;
+        this.leftMatched = false;
+      }
+      const right = this.rightRows![this.rightIdx];
+      if (right === undefined) {
+        if (!this.leftMatched) {
+          // unmatched left rows are dropped in a right join
+        }
+        this.leftRow = null;
+        continue;
+      }
+      this.rightIdx++;
+      const values = [...this.leftRow.values, ...right.values];
+      const names = [...this.leftRow.schema, ...right.schema];
+      const tabs = [...this.leftRow.tables, ...right.tables];
+      if (this.on) {
+        const v = await evalFilterExpr(this.on, makeRow(values, names, tabs), this.ctx);
+        if (truthy(v)) {
+          this.leftMatched = true;
+          this.matchedRight!.add(this.rightIdx - 1);
+          return makeRow(values, names, tabs);
+        }
+      } else {
+        this.matchedRight!.add(this.rightIdx - 1);
         return makeRow(values, names, tabs);
       }
     }
@@ -535,11 +609,11 @@ export function buildOperator(plan: PlanNode, ctx: ExecContext): Operator {
       return new ScanOperator(plan as TableScanNode, ctx);
     case "filter": {
       const p = plan as FilterNode;
-      return new FilterOperator(buildOperator(p.children[0], ctx), p.expr);
+      return new FilterOperator(buildOperator(p.children[0], ctx), p.expr, ctx);
     }
     case "project": {
       const p = plan as ProjectNode;
-      return new ProjectOperator(buildOperator(p.children[0], ctx), p);
+      return new ProjectOperator(buildOperator(p.children[0], ctx), p, ctx);
     }
     case "join": {
       const p = plan as JoinNode;
@@ -552,7 +626,7 @@ export function buildOperator(plan: PlanNode, ctx: ExecContext): Operator {
           return new HashJoinOperator(left, right, eq.leftKeys, eq.rightKeys, eq.extraOn, p.joinType);
         }
       }
-      return new NestedLoopJoinOperator(left, right, p.on, p.joinType);
+      return new NestedLoopJoinOperator(left, right, p.on, p.joinType, ctx);
     }
     case "aggregate": {
       const p = plan as AggregateNode;
