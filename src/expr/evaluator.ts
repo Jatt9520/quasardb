@@ -122,6 +122,9 @@ export function evalExpr(expr: Expr, row: EvalContext, meta?: RowMetadata | null
 
     case "func":
       return evalFunc(expr, row);
+
+    case "scalar":
+      throw new EvalError("Scalar subquery requires asynchronous evaluation");
   }
 }
 
@@ -210,13 +213,14 @@ export interface SubqueryRow {
 
 /** Executes a subquery SELECT against the engine. */
 export interface SubqueryRunner {
-  run(sub: SelectStmt): Promise<SubqueryRow[]>;
+  run(sub: SelectStmt, outer: EvalContext | null): Promise<SubqueryRow[]>;
 }
 
 /** True when the expression contains EXISTS or IN (subquery) nodes. */
 export function containsSubquery(e: Expr): boolean {
   switch (e.kind) {
     case "exists":
+    case "scalar":
       return true;
     case "in":
       return e.subquery !== null || containsSubquery(e.expr);
@@ -310,7 +314,7 @@ export async function evalExprAsync(expr: Expr, row: EvalContext, sub: SubqueryR
         return expr.negated;
       }
       if (expr.subquery) {
-        const rows = await sub.run(expr.subquery);
+        const rows = await sub.run(expr.subquery, row);
         if (v === null) return NULL;
         let sawNull = false;
         for (const r of rows) {
@@ -328,9 +332,15 @@ export async function evalExprAsync(expr: Expr, row: EvalContext, sub: SubqueryR
       return NULL;
     }
     case "exists": {
-      const rows = await sub.run(expr.subquery);
+      const rows = await sub.run(expr.subquery, row);
       const has = rows.length > 0;
       return expr.negated ? !has : has;
+    }
+    case "scalar": {
+      const rows = await sub.run(expr.subquery, row);
+      if (rows.length === 0) return NULL;
+      const r = rows[0];
+      return r.schema.length > 0 ? r.values[0] : NULL;
     }
     case "cast": {
       const v = await evalExprAsync(expr.expr, row, sub);

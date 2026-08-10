@@ -24,7 +24,7 @@ export function makeRow(values: Value[], schema: string[], tables: string[]): Ro
 }
 
 /** Standard eval context: resolve by column name (first match wins). */
-export function rowContext(row: Row, tableHint?: string | null): {
+export function rowContext(row: Row, tableHint?: string | null, fallback?: import("../expr/evaluator.js").EvalContext | null): {
   getColumn(name: string, hint: string | null): Value;
 } {
   return {
@@ -37,6 +37,7 @@ export function rowContext(row: Row, tableHint?: string | null): {
           return row.values[i];
         }
       }
+      if (fallback) return fallback.getColumn(name, hint);
       throw new Error(`no column "${name}"`);
     },
   };
@@ -77,6 +78,8 @@ export interface ExecContext {
   meta: Map<string, TableMeta>;
   indexes: Map<string, BtreeIndex[]>;
   subquery?: SubqueryRunner;
+  /** outer row context for correlated subqueries */
+  outer?: import("../expr/evaluator.js").EvalContext | null;
   emitProgress?: (label: string, rowCount: number) => void;
 }
 
@@ -140,11 +143,12 @@ export class FilterOperator extends BaseOperator {
 
 /** Eval an expression on a row, using the async subquery path when needed. */
 function evalFilterExpr(expr: Expr, row: Row, ctx: ExecContext): Promise<Value> | Value {
+  const rc = rowContext(row, undefined, ctx.outer ?? null);
   if (containsSubquery(expr)) {
     if (!ctx.subquery) throw new Error("Subquery execution is not available in this context");
-    return evalExprAsync(expr, rowContext(row), ctx.subquery);
+    return evalExprAsync(expr, rc, ctx.subquery);
   }
-  return evalExpr(expr, rowContext(row));
+  return evalExpr(expr, rc);
 }
 
 export class ProjectOperator extends BaseOperator {
@@ -410,6 +414,10 @@ export class HashAggregateOperator extends BaseOperator {
         const existing = this.groups.get(keyStr);
         if (existing) existing.rows.push(row);
         else this.groups.set(keyStr, { key: keyRow, rows: [row] });
+      }
+      // no GROUP BY: a single global group, even over zero input rows
+      if (this.node.groupBy.length === 0 && this.groups.size === 0) {
+        this.groups.set("", { key: makeRow([], [], []), rows: [] });
       }
       this.built = true;
       this.iter = this.groups.values();

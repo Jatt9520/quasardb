@@ -77,6 +77,14 @@ describe("INSERT / SELECT", () => {
     expect(r.rows).toEqual([["alice", 2]]);
     const r2 = await q("SELECT first, count(*) AS n FROM names GROUP BY first HAVING count(*) = 1 ORDER BY first");
     expect(r2.rows).toEqual([["bob", 1], ["carol", 1]]);
+    const r3 = await q(
+      "SELECT count(*) AS n FROM names GROUP BY first HAVING first = 'alice' ORDER BY n",
+    );
+    expect(r3.rows).toEqual([[2]]);
+    const r4 = await q(
+      "SELECT count(*) AS n FROM names GROUP BY first HAVING first != 'alice' ORDER BY first",
+    );
+    expect(r4.rows).toEqual([[1], [1]]);
   });
 
   it("supports LIKE", async () => {
@@ -149,6 +157,34 @@ describe("subqueries", () => {
     expect(r2.rowCount).toBe(4);
     const r3 = await q("SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > 1000)");
     expect(r3.rowCount).toBe(0);
+  });
+
+  it("correlated EXISTS", async () => {
+    const r = await q(
+      "SELECT name FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id) ORDER BY u.id",
+    );
+    expect(r.rows).toEqual([["alice"], ["bob"]]);
+    const r2 = await q(
+      "SELECT name FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id) ORDER BY u.id",
+    );
+    expect(r2.rows).toEqual([["carol"], ["alice"]]);
+  });
+
+  it("correlated IN", async () => {
+    const r = await q("SELECT name FROM users u WHERE u.id IN (SELECT o.user_id FROM orders o WHERE o.total > 50)");
+    expect(r.rows).toEqual([["alice"]]);
+  });
+
+  it("scalar subquery in SELECT list", async () => {
+    const r = await q(
+      "SELECT name, (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS n FROM users u ORDER BY u.id",
+    );
+    expect(r.rows).toEqual([
+      ["alice", 1],
+      ["bob", 1],
+      ["carol", 0],
+      ["alice", 0],
+    ]);
   });
 });
 

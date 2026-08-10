@@ -109,7 +109,8 @@ export type Expr =
   | { kind: "between"; expr: Expr; low: Expr; high: Expr; negated: boolean }
   | { kind: "like"; expr: Expr; pattern: Expr; negated: boolean }
   | { kind: "isnull"; expr: Expr; negated: boolean }
-  | { kind: "is"; expr: Expr; value: Literal | null; negated: boolean };
+  | { kind: "is"; expr: Expr; value: Literal | null; negated: boolean }
+  | { kind: "scalar"; subquery: SelectStmt };
 
 export type Literal = number | string | boolean | null;
 

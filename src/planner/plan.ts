@@ -138,6 +138,8 @@ export function exprToString(e: Expr): string {
       return `${exprToString(e.expr)} IS ${e.negated ? "NOT " : ""}NULL`;
     case "exists":
       return `${e.negated ? "NOT " : ""}EXISTS(...)`;
+    case "scalar":
+      return `(SELECT ...)`;
   }
 }
 

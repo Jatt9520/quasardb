@@ -57,13 +57,12 @@ export class Planner {
       stmt.groupBy.length > 0 || stmt.items.some((i) => i.kind === "expr" && isAggregateCall(i.expr));
 
     if (hasAggregates) {
-      // aggregate → relabel: HAVING / ORDER BY reference final output names (alias or outputName)
+      // aggregate → HAVING → sort, all over __grp_i / __agg_i → relabel
       root = this.buildAggregate(stmt, root);
-      root = this.buildRelabel(stmt, root);
       if (stmt.having) {
         const filter: FilterNode = {
           kind: "filter",
-          expr: this.rewriteAggExpr(stmt, stmt.having),
+          expr: this.rewriteHavingExpr(stmt, stmt.having),
           children: [root],
           output: root.output,
         };
@@ -72,6 +71,7 @@ export class Planner {
       if (stmt.orderBy.length > 0) {
         root = this.buildSort(stmt, root, true);
       }
+      root = this.buildRelabel(stmt, root);
     } else {
       // sort before project so keys may reference non-selected / qualified columns
       if (stmt.orderBy.length > 0) {
@@ -168,7 +168,7 @@ export class Planner {
   }
 
   private rewriteSortExpr(stmt: SelectStmt, expr: Expr, aggregate: boolean): Expr {
-    if (aggregate) return this.rewriteAggExpr(stmt, expr);
+    if (aggregate) return this.rewriteHavingExpr(stmt, expr);
     // non-aggregate: ORDER BY alias → the underlying select expression
     if (expr.kind === "col") {
       const item = stmt.items.find(
@@ -182,34 +182,38 @@ export class Planner {
 
   /**
    * Rewrites a HAVING / aggregate ORDER BY expression so it can be evaluated on
-   * relabeled aggregate rows (columns are the final output names).
+   * aggregate output rows (columns are __grp_i / __agg_i). References may target
+   * select aliases, aggregates, and group columns (selected or not).
    */
-  private rewriteAggExpr(stmt: SelectStmt, expr: Expr): Expr {
+  private rewriteHavingExpr(stmt: SelectStmt, expr: Expr): Expr {
+    return this.rwHaving(stmt, expr, true);
+  }
+
+  private rwHaving(stmt: SelectStmt, expr: Expr, allowAlias: boolean): Expr {
     if (isAggregateCall(expr)) {
-      const item = stmt.items.find((i) => i.kind === "expr" && exprEq(i.expr, expr));
-      if (item && item.kind === "expr") {
-        return { kind: "col", table: null, name: item.alias ?? outputName(item.expr) };
-      }
-      return expr;
+      const idx = this.aggItemIndex(stmt, expr);
+      if (idx >= 0) return { kind: "col", table: null, name: `__agg_${idx}` };
+      throw new PlannerError("references an aggregate not present in the SELECT list");
     }
     if (expr.kind === "col") {
-      const item = stmt.items.find(
-        (i): i is { kind: "expr"; expr: Expr; alias: string | null } =>
-          i.kind === "expr" && (i.alias ?? outputName(i.expr)).toLowerCase() === expr.name.toLowerCase(),
-      );
-      if (item) return { kind: "col", table: null, name: item.alias ?? outputName(item.expr) };
-      return expr;
+      if (allowAlias) {
+        const item = stmt.items.find((i) => i.kind === "expr" && (i.alias ?? outputName(i.expr)).toLowerCase() === expr.name.toLowerCase());
+        if (item && item.kind === "expr") return this.rwHaving(stmt, item.expr, false);
+      }
+      const gbIdx = stmt.groupBy.findIndex((g) => exprEq(g, expr));
+      if (gbIdx >= 0) return { kind: "col", table: null, name: `__grp_${gbIdx}` };
+      throw new PlannerError(`references column "${expr.name}" which is not a group column, alias, or aggregate`);
     }
     if (expr.kind === "binop") {
       return {
         kind: "binop",
         op: expr.op,
-        left: this.rewriteAggExpr(stmt, expr.left),
-        right: this.rewriteAggExpr(stmt, expr.right),
+        left: this.rewriteHavingExpr(stmt, expr.left),
+        right: this.rewriteHavingExpr(stmt, expr.right),
       };
     }
     if (expr.kind === "unop") {
-      return { kind: "unop", op: expr.op, operand: this.rewriteAggExpr(stmt, expr.operand) };
+      return { kind: "unop", op: expr.op, operand: this.rewriteHavingExpr(stmt, expr.operand) };
     }
     if (expr.kind === "func") {
       return {
@@ -217,10 +221,68 @@ export class Planner {
         name: expr.name,
         star: expr.star,
         distinct: expr.distinct,
-        args: expr.args.map((a) => this.rewriteAggExpr(stmt, a)),
+        args: expr.args.map((a) => this.rewriteHavingExpr(stmt, a)),
+      };
+    }
+    if (expr.kind === "case") {
+      return {
+        kind: "case",
+        operand: expr.operand ? this.rewriteHavingExpr(stmt, expr.operand) : null,
+        whens: expr.whens.map((w) => ({
+          when: this.rewriteHavingExpr(stmt, w.when),
+          then: this.rewriteHavingExpr(stmt, w.then),
+        })),
+        els: expr.els ? this.rewriteHavingExpr(stmt, expr.els) : null,
+      };
+    }
+    if (expr.kind === "between") {
+      return {
+        kind: "between",
+        expr: this.rewriteHavingExpr(stmt, expr.expr),
+        low: this.rewriteHavingExpr(stmt, expr.low),
+        high: this.rewriteHavingExpr(stmt, expr.high),
+        negated: expr.negated,
+      };
+    }
+    if (expr.kind === "like") {
+      return {
+        kind: "like",
+        expr: this.rewriteHavingExpr(stmt, expr.expr),
+        pattern: this.rewriteHavingExpr(stmt, expr.pattern),
+        negated: expr.negated,
+      };
+    }
+    if (expr.kind === "isnull") {
+      return { kind: "isnull", expr: this.rewriteHavingExpr(stmt, expr.expr), negated: expr.negated };
+    }
+    if (expr.kind === "is") {
+      return {
+        kind: "is",
+        expr: this.rewriteHavingExpr(stmt, expr.expr),
+        value: expr.value,
+        negated: expr.negated,
+      };
+    }
+    if (expr.kind === "cast") {
+      return { kind: "cast", expr: this.rewriteHavingExpr(stmt, expr.expr), type: expr.type };
+    }
+    if (expr.kind === "in") {
+      return {
+        kind: "in",
+        expr: this.rewriteHavingExpr(stmt, expr.expr),
+        subquery: expr.subquery,
+        list: expr.list ? expr.list.map((x) => this.rewriteHavingExpr(stmt, x)) : null,
+        negated: expr.negated,
       };
     }
     return expr;
+  }
+
+  private aggItemIndex(stmt: SelectStmt, expr: Expr): number {
+    const aggItems = stmt.items.filter(
+      (i): i is { kind: "expr"; expr: Expr; alias: string | null } => i.kind === "expr" && isAggregateCall(i.expr),
+    );
+    return aggItems.findIndex((i) => exprEq(i.expr, expr));
   }
 
   private buildProject(stmt: SelectStmt, child: PlanNode): ProjectNode {
@@ -359,6 +421,8 @@ function exprEq(a: Expr, b: Expr): boolean {
     }
     case "exists":
       return a.subquery === (b as { subquery: SelectStmt }).subquery && a.negated === (b as { negated: boolean }).negated;
+    case "scalar":
+      return a.subquery === (b as { subquery: SelectStmt }).subquery;
   }
 }
 

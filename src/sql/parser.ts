@@ -661,6 +661,12 @@ class Parser {
     }
     if (t.type === "op" && t.text === "(") {
       this.next();
+      if (this.isKeyword("select")) {
+        // scalar subquery: (SELECT ...)
+        const sub = this.parseSelect();
+        this.expectOp(")");
+        return { kind: "scalar", subquery: sub };
+      }
       const e = this.parseExpression();
       this.expectOp(")");
       return e;

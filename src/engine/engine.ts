@@ -401,10 +401,14 @@ export class Engine {
       indexes: this.indexes,
     };
     ctx.subquery = {
-      run: async (sub: SelectStmt): Promise<import("../expr/evaluator.js").SubqueryRow[]> => {
+      run: async (
+        sub: SelectStmt,
+        outer: import("../expr/evaluator.js").EvalContext | null,
+      ): Promise<import("../expr/evaluator.js").SubqueryRow[]> => {
         const subPlanner = new Planner({ tables });
         const subPlan = subPlanner.planSelect(sub);
-        const subRoot = buildOperator(subPlan, ctx);
+        const subCtx: ExecContext = { ...ctx, outer };
+        const subRoot = buildOperator(subPlan, subCtx);
         const rows: import("../expr/evaluator.js").SubqueryRow[] = [];
         for (;;) {
           const r = await subRoot.next();
