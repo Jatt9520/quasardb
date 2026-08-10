@@ -1,4 +1,5 @@
 import type { Expr, JoinClause, SelectItem, SelectStmt, TableRef } from "../sql/ast.js";
+import type { Value } from "../expr/value.js";
 
 // ==================== Logical plan tree ====================
 
@@ -16,6 +17,21 @@ export interface TableScanNode extends PlanNode {
   table: string;
   alias: string;
   columns: string[];
+  children: [];
+}
+
+/** Index access path: iterate rows whose index key falls in [lo, hi]. */
+export interface IndexScanNode extends PlanNode {
+  kind: "indexscan";
+  table: string;
+  alias: string;
+  columns: string[];
+  index: string;
+  /** equality keys on the leading index columns (may be empty) */
+  prefix: { col: string; value: Value }[];
+  /** optional trailing range bound; always inclusive — the WHERE re-checks strictness */
+  lo: { col: string; value: Value } | null;
+  hi: { col: string; value: Value } | null;
   children: [];
 }
 
@@ -89,6 +105,14 @@ export function planToString(plan: PlanNode, indent = 0): string {
     case "scan": {
       const p = plan as TableScanNode;
       s += ` ${p.table} [${p.columns.join(", ")}]`;
+      break;
+    }
+    case "indexscan": {
+      const p = plan as IndexScanNode;
+      s += ` ${p.table} ON ${p.index}`;
+      if (p.prefix.length > 0) s += ` ${p.prefix.map((k) => `${k.col} = ${String(k.value)}`).join(" AND ")}`;
+      if (p.lo) s += ` ${p.lo.col} >= ${String(p.lo.value)}`;
+      if (p.hi) s += ` ${p.hi.col} <= ${String(p.hi.value)}`;
       break;
     }
     case "filter":

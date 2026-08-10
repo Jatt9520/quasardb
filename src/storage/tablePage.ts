@@ -117,16 +117,9 @@ export class TablePage implements TablePageView {
   delete(index: number): void {
     const n = this.slotCount();
     if (index >= n) return;
-    const slots = this.slots();
-    const s = slots[index];
-    // swap-last deletion to keep the array compact
-    if (index !== n - 1) {
-      const last = slots[n - 1];
-      writeU16(this.page, this.slotOffsetOf(index), last.offset);
-      writeU16(this.page, this.slotOffsetOf(index) + 2, last.length);
-    }
-    writeU16(this.page, 12, n - 1);
-    void s;
+    // tombstone the slot (length = 0) instead of compacting: slot indexes and
+    // record ids must stay stable for index lookups
+    writeU16(this.page, this.slotOffsetOf(index) + 2, 0);
   }
 
   update(index: number, record: Uint8Array): boolean {

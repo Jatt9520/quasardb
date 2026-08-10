@@ -1,12 +1,13 @@
 import { BtreeEntry } from "../btree/btree.js";
 import { BtreeIndex } from "../btree/btree.js";
+import { compareKeys, decodeCompositeKeyParts, decodeTypedKey, encodeCompositeKey, encodeTypedKey } from "../btree/btree.js";
 import { Expr } from "../sql/ast.js";
 import { TableHeap } from "../storage/tableHeap.js";
 import { Value, compareValues, truthy, valueHashKey } from "../expr/value.js";
 import { containsSubquery, evalExpr, evalExprAsync, SubqueryRunner } from "../expr/evaluator.js";
 import { TableMeta } from "../storage/catalog.js";
 import { deserializeRow, Schema, schemaOf } from "../storage/record.js";
-import { AggregateNode, DistinctNode, FilterNode, JoinNode, LimitNode, PlanNode, ProjectNode, SetOpNode, SortNode, TableScanNode } from "../planner/plan.js";
+import { AggregateNode, DistinctNode, FilterNode, IndexScanNode, JoinNode, LimitNode, PlanNode, ProjectNode, SetOpNode, SortNode, TableScanNode } from "../planner/plan.js";
 
 // ========================= Row model =========================
 
@@ -119,6 +120,95 @@ export class ScanOperator extends BaseOperator {
     const row = deserializeRow(this.schema!, res.value.record);
     this.stats.pages++;
     return makeRow(row, this.schemaNames, this.tables);
+  }
+}
+
+export class IndexScanOperator extends BaseOperator {
+  constructor(
+    private node: IndexScanNode,
+    private ctx: ExecContext,
+  ) {
+    super();
+  }
+
+  private iter: AsyncIterator<BtreeEntry & { pageId: number }> | null = null;
+  private locator: Map<number, { pageId: number; index: number }> | null = null;
+  private schema: Schema | null = null;
+  private schemaNames: string[] = [];
+  private tables: string[] = [];
+  private tableKey = "";
+  private prefixLen = 0;
+  private prefixValues: Value[] = [];
+  private singleCol = false;
+
+  private colType(col: string): string {
+    const c = this.schema?.columns.find((x) => x.name.toLowerCase() === col.toLowerCase());
+    return c?.type ?? "text";
+  }
+
+  async nextInner(): Promise<Row | null> {
+    if (!this.iter) {
+      this.tableKey = this.node.table.toLowerCase();
+      const meta = this.ctx.meta.get(this.tableKey);
+      if (!meta) throw new Error(`Table "${this.node.table}" not found`);
+      this.schema = schemaOf(meta.name, meta.columns);
+      this.schemaNames = meta.columns.map((c) => c.name);
+      this.tables = meta.columns.map(() => this.node.alias.toLowerCase());
+      const idx = this.ctx.indexes.get(this.tableKey)?.find((i) => i.name.toLowerCase() === this.node.index.toLowerCase());
+      if (!idx) throw new Error(`Index "${this.node.index}" not found`);
+      this.prefixLen = this.node.prefix.length;
+      this.prefixValues = this.node.prefix.map((k) => k.value);
+      this.singleCol = idx.columns.length === 1;
+      this.iter = idx.scanRange(this.buildBound(this.node.lo), null)[Symbol.asyncIterator]();
+      this.locator = new Map();
+      for await (const { pageId, index, rid } of this.heap.scan()) {
+        this.locator.set(rid, { pageId, index });
+      }
+    }
+    const p = this.node.prefix;
+    for (;;) {
+      const res = await this.iter.next();
+      if (res.done) return null;
+      const parts = this.singleCol
+        ? [decodeTypedKey(res.value.key)]
+        : decodeCompositeKeyParts(res.value.key);
+      // rows are ordered by (prefix values, rest): stop once the prefix diverges
+      let inPrefix = parts.length >= this.prefixLen;
+      if (inPrefix) {
+        for (let i = 0; i < this.prefixLen; i++) {
+          if (compareValues(parts[i], this.prefixValues[i]) !== 0) {
+            inPrefix = false;
+            break;
+          }
+        }
+      }
+      if (!inPrefix) return null;
+      if (this.node.hi && parts.length > this.prefixLen && compareValues(parts[this.prefixLen], this.node.hi.value) > 0) {
+        return null;
+      }
+      const loc = this.locator!.get(res.value.value);
+      if (!loc) continue;
+      const record = await this.heap.getSlot(loc.pageId, loc.index);
+      if (record === null) continue;
+      const row = deserializeRow(this.schema!, record);
+      this.stats.pages++;
+      return makeRow(row, this.schemaNames, this.tables);
+    }
+  }
+
+  /** Start key for the scan: composite(prefix values..., bound) or a bare typed key. */
+  private buildBound(bound: { col: string; value: Value } | null): Uint8Array | null {
+    const parts: Uint8Array[] = [];
+    for (const k of this.node.prefix) parts.push(encodeTypedKey(k.value, this.colType(k.col)));
+    if (bound) parts.push(encodeTypedKey(bound.value, this.colType(bound.col)));
+    if (parts.length === 0) return null;
+    return parts.length === 1 ? parts[0] : encodeCompositeKey(parts);
+  }
+
+  private get heap(): TableHeap {
+    const h = this.ctx.heaps.get(this.tableKey);
+    if (!h) throw new Error(`Table "${this.node.table}" not found`);
+    return h;
   }
 }
 
@@ -706,6 +796,8 @@ export function buildOperator(plan: PlanNode, ctx: ExecContext): Operator {
   switch (plan.kind) {
     case "scan":
       return new ScanOperator(plan as TableScanNode, ctx);
+    case "indexscan":
+      return new IndexScanOperator(plan as IndexScanNode, ctx);
     case "filter": {
       const p = plan as FilterNode;
       return new FilterOperator(buildOperator(p.children[0], ctx), p.expr, ctx);

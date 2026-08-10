@@ -14,6 +14,7 @@ export class TableHeap {
   private static HEADER_RECORDS_OFFSET = 16;
   private static HEADER_NEXT_PAGE_OFFSET = 8;
   private static HEADER_AUTOINC_OFFSET = 20;
+  private static HEADER_RID_SEQ_OFFSET = 24;
 
   constructor(name: string, headerPageId: number, pool: BufferPool) {
     this.name = name;
@@ -29,6 +30,7 @@ export class TableHeap {
     dv.setUint16(8, 0, true); // next page = none
     dv.setUint32(16, 0, true); // record count
     dv.setUint32(20, 0, true); // autoinc cursor
+    dv.setUint32(24, 0, true); // rid sequence (immutable record ids for indexes)
     await pool.unpin(header.id, true);
     return new TableHeap(name, header.id, pool);
   }
@@ -41,7 +43,7 @@ export class TableHeap {
     return this.headerPageId;
   }
 
-  private async readHeader(): Promise<{ firstPage: number; count: number; autoinc: number }> {
+  private async readHeader(): Promise<{ firstPage: number; count: number; autoinc: number; ridSeq: number }> {
     const page = await this.pool.pin(this.headerPageId);
     try {
       const dv = new DataView(page.data.buffer, page.data.byteOffset, page.data.byteLength);
@@ -49,19 +51,21 @@ export class TableHeap {
         firstPage: dv.getUint16(8, true),
         count: dv.getUint32(16, true),
         autoinc: dv.getUint32(20, true),
+        ridSeq: dv.getUint32(24, true),
       };
     } finally {
       await this.pool.unpin(this.headerPageId, false);
     }
   }
 
-  private async writeHeader(firstPage: number, count: number, autoinc: number): Promise<void> {
+  private async writeHeader(firstPage: number, count: number, autoinc: number, ridSeq: number): Promise<void> {
     const page = await this.pool.pin(this.headerPageId);
     try {
       const dv = new DataView(page.data.buffer, page.data.byteOffset, page.data.byteLength);
       dv.setUint16(8, firstPage, true);
       dv.setUint32(16, count, true);
       dv.setUint32(20, autoinc, true);
+      dv.setUint32(24, ridSeq, true);
       this.dirty = true;
     } finally {
       await this.pool.unpin(this.headerPageId, true);
@@ -76,7 +80,15 @@ export class TableHeap {
   async nextAutoInc(): Promise<number> {
     const h = await this.readHeader();
     const v = h.autoinc + 1;
-    await this.writeHeader(h.firstPage, h.count, v);
+    await this.writeHeader(h.firstPage, h.count, v, h.ridSeq);
+    return v;
+  }
+
+  /** Allocate the next immutable record id (used by indexes). */
+  async nextRid(): Promise<number> {
+    const h = await this.readHeader();
+    const v = h.ridSeq + 1;
+    await this.writeHeader(h.firstPage, h.count, h.autoinc, v);
     return v;
   }
 
@@ -120,7 +132,7 @@ export class TableHeap {
       new TablePage(prev).setNextPage(newPage.id);
       await this.pool.unpin(prevPid, true);
     } else {
-      await this.writeHeader(newPage.id, h.count + 1, h.autoinc);
+      await this.writeHeader(newPage.id, h.count + 1, h.autoinc, h.ridSeq);
     }
     await this.pool.unpin(newPage.id, true);
     await this.bumpCount(1);
@@ -128,25 +140,29 @@ export class TableHeap {
 
   private async bumpCount(delta: number): Promise<void> {
     const h = await this.readHeader();
-    await this.writeHeader(h.firstPage, h.count + delta, h.autoinc);
+    await this.writeHeader(h.firstPage, h.count + delta, h.autoinc, h.ridSeq);
   }
 
-  scan(): AsyncIterable<{ pageId: number; index: number; record: Uint8Array; delete: () => Promise<void> }> {
+  scan(): AsyncIterable<{ pageId: number; index: number; rid: number; record: Uint8Array; delete: () => Promise<void> }> {
     const self = this;
     return {
       async *[Symbol.asyncIterator]() {
         const h = await self.readHeader();
         let pid = h.firstPage;
+        let rid = 0;
         while (pid !== 0) {
           const pg = await self.pool.pin(pid);
           const tp = new TablePage(pg);
           const next = tp.nextPage;
           const slots = tp.slots();
           for (let i = 0; i < slots.length; i++) {
+            rid++;
+            if (slots[i].length === 0) continue; // tombstoned
             const rec = pg.data.slice(slots[i].offset, slots[i].offset + slots[i].length);
             yield {
               pageId: pid,
               index: i,
+              rid,
               record: rec,
               delete: async () => {
                 const pg2 = await self.pool.pin(pid);

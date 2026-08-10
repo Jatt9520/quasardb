@@ -1,13 +1,23 @@
 import type { Expr, Literal, SelectStmt, SetOpStmt, SqlType, TableRef } from "../sql/ast.js";
+import type { Value } from "../expr/value.js";
+import { compareValues } from "../expr/value.js";
 import {
-  AggregateNode, DistinctNode, FilterNode, JoinNode, LimitNode, PlanNode,
+  AggregateNode, DistinctNode, FilterNode, IndexScanNode, JoinNode, LimitNode, PlanNode,
   ProjectNode, SetOpNode, SortNode, TableScanNode,
 } from "./plan.js";
 import { isAggregateCall } from "./plan.js";
 
+export interface IndexInfo {
+  name: string;
+  columns: string[];
+  unique: boolean;
+}
+
 export interface PlannerContext {
   /** table -> list of column names (from catalog) */
   tables: Map<string, string[]>;
+  /** table -> available indexes (from catalog) */
+  indexes?: Map<string, IndexInfo[]>;
 }
 
 export class PlannerError extends Error {}
@@ -49,6 +59,11 @@ export class Planner {
     }
 
     if (stmt.where) {
+      // single-table queries may use an index as the access path
+      if (stmt.from && stmt.from.kind === "table" && stmt.joins.length === 0) {
+        const idx = this.tryIndexScan(stmt);
+        if (idx) root = idx;
+      }
       const filter: FilterNode = {
         kind: "filter",
         expr: stmt.where,
@@ -347,6 +362,85 @@ export class Planner {
     return null;
   }
 
+  /** Pick an index usable by the WHERE clause; returns an index scan node or null. */
+  private tryIndexScan(stmt: SelectStmt): IndexScanNode | null {
+    const ref = stmt.from;
+    if (!ref || ref.kind !== "table") return null;
+    const tableKey = ref.table.toLowerCase();
+    const alias = (ref.alias ?? ref.table).toLowerCase();
+    const tCols = this.ctx.tables.get(tableKey) ?? [];
+    const preds: IndexPred[] = [];
+    for (const c of splitAnd(stmt.where!)) {
+      const p = asIndexPred(c, tCols, alias);
+      if (p) preds.push(p);
+    }
+    if (preds.length === 0) return null;
+    const candidates = this.ctx.indexes?.get(tableKey) ?? [];
+    let best: { name: string; prefix: IndexPred[]; range: IndexPred | null; score: number } | null = null;
+    for (const info of candidates) {
+      const prefix: IndexPred[] = [];
+      let range: IndexPred | null = null;
+      for (const col of info.columns) {
+        const c = col.toLowerCase();
+        const eq = preds.find((p) => p.col === c && p.op === "eq");
+        if (eq) {
+          prefix.push(eq);
+          continue;
+        }
+        const r = preds.find((p) => p.col === c && p.op !== "eq");
+        if (r && !range) range = r;
+        break;
+      }
+      if (prefix.length === 0 && !range) continue;
+      const score = prefix.length * 100 + (range ? 10 : 0) - info.columns.length;
+      if (!best || score > best.score) best = { name: info.name, prefix, range, score };
+    }
+    if (!best) return null;
+    let lo: { col: string; value: Value } | null = null;
+    let hi: { col: string; value: Value } | null = null;
+    if (best.range) {
+      const r = best.range;
+      switch (r.op) {
+        case "gt":
+        case "ge":
+          lo = { col: r.col, value: r.values[0] };
+          break;
+        case "lt":
+        case "le":
+          hi = { col: r.col, value: r.values[0] };
+          break;
+        case "between":
+          lo = { col: r.col, value: r.values[0] };
+          hi = { col: r.col, value: r.values[1] };
+          break;
+        case "in": {
+          let min = r.values[0];
+          let max = r.values[0];
+          for (const v of r.values) {
+            if (compareValues(min, v) > 0) min = v;
+            if (compareValues(max, v) < 0) max = v;
+          }
+          lo = { col: r.col, value: min };
+          hi = { col: r.col, value: max };
+          break;
+        }
+      }
+    }
+    const node: IndexScanNode = {
+      kind: "indexscan",
+      table: ref.table,
+      alias: ref.alias ?? ref.table,
+      columns: tCols,
+      index: best.name,
+      prefix: best.prefix.map((p) => ({ col: p.col, value: p.values[0] })),
+      lo,
+      hi,
+      children: [],
+      output: tCols,
+    };
+    return node;
+  }
+
   private planTableRef(ref: TableRef): PlanNode {
     if (ref.kind === "subquery") {
       const subPlanner = new Planner(this.ctx);
@@ -487,4 +581,72 @@ export function hasAggregateExpr(e: Expr): boolean {
   if (e.kind === "unop") return hasAggregateExpr(e.operand);
   if (e.kind === "func") return e.args.some(hasAggregateExpr);
   return false;
+}
+
+// ---------------- index predicate helpers ----------------
+
+interface IndexPred {
+  col: string;
+  op: "eq" | "gt" | "ge" | "lt" | "le" | "between" | "in";
+  values: Value[];
+}
+
+function splitAnd(e: Expr): Expr[] {
+  if (e.kind === "binop" && e.op === "and") return [...splitAnd(e.left), ...splitAnd(e.right)];
+  return [e];
+}
+
+function literalValue(e: Expr): Value | null {
+  if (e.kind === "literal") return e.value as Value;
+  if (e.kind === "unop" && e.op === "-" && e.operand.kind === "literal" && typeof e.operand.value === "number") {
+    return -e.operand.value;
+  }
+  return null;
+}
+
+function colName(e: Expr, cols: string[], alias: string): string | null {
+  if (e.kind !== "col") return null;
+  if (e.table && e.table.toLowerCase() !== alias) return null;
+  const n = e.name.toLowerCase();
+  if (!cols.some((c) => c.toLowerCase() === n)) return null;
+  return n;
+}
+
+function asIndexPred(e: Expr, cols: string[], alias: string): IndexPred | null {
+  if (e.kind === "binop" && ["=", ">", ">=", "<", "<="].includes(e.op)) {
+    const c = colName(e.left, cols, alias);
+    const v = c ? literalValue(e.right) : null;
+    if (c && v !== null) {
+      const op = e.op === "=" ? "eq" : e.op === ">" ? "gt" : e.op === ">=" ? "ge" : e.op === "<" ? "lt" : "le";
+      return { col: c, op, values: [v] };
+    }
+    const cr = colName(e.right, cols, alias);
+    const cv = cr ? literalValue(e.left) : null;
+    if (cr && cv !== null) {
+      const op = e.op === "=" ? "eq" : e.op === ">" ? "lt" : e.op === ">=" ? "le" : e.op === "<" ? "gt" : "ge";
+      return { col: cr, op, values: [cv] };
+    }
+    return null;
+  }
+  if (e.kind === "between" && !e.negated) {
+    const c = colName(e.expr, cols, alias);
+    if (!c) return null;
+    const lo = literalValue(e.low);
+    const hi = literalValue(e.high);
+    if (lo === null || hi === null) return null;
+    return { col: c, op: "between", values: [lo, hi] };
+  }
+  if (e.kind === "in" && !e.negated && e.list && !e.subquery) {
+    const c = colName(e.expr, cols, alias);
+    if (!c) return null;
+    const vals: Value[] = [];
+    for (const item of e.list) {
+      const v = literalValue(item);
+      if (v === null) return null;
+      vals.push(v);
+    }
+    if (vals.length === 0) return null;
+    return { col: c, op: "in", values: vals };
+  }
+  return null;
 }

@@ -6,7 +6,7 @@ import {
   ColumnDef, DeleteStmt, Expr, InsertStmt, SelectStmt, SetOpStmt, SqlType, Statement,
   UpdateStmt, CreateTableStmt, CreateIndexStmt, DropTableStmt, DropIndexStmt,
 } from "../sql/ast.js";
-import { Planner } from "../planner/planner.js";
+import { Planner, IndexInfo } from "../planner/planner.js";
 import { buildOperator, ExecContext, Row, rowContext } from "../executor/executor.js";
 import { evalExpr } from "../expr/evaluator.js";
 import { Value, coerceToType, formatValue } from "../expr/value.js";
@@ -219,8 +219,7 @@ export class Engine {
     const heap = this.heaps.get(tKey)!;
     const schema = { name: meta.name, columns: meta.columns };
     let good = true;
-    let rid = 1;
-    for await (const { record } of heap.scan()) {
+    for await (const { record, rid } of heap.scan()) {
       const row = deserializeRow(schema, record);
       const key = encodeCompositeIndexKey(cols, row, meta);
       try {
@@ -229,7 +228,6 @@ export class Engine {
         good = false;
         throw e;
       }
-      rid++;
     }
     if (!good) throw new Error("Index build failed");
     const imeta: IndexMeta = {
@@ -330,10 +328,10 @@ export class Engine {
         }
       }
       const record = serializeRow(schema, coerced);
+      const rid = await heap.nextRid();
       await heap.append(record);
       // insert into all indexes
       const idxs = this.indexes.get(tKey) ?? [];
-      const rid = await heap.recordCount();
       for (const idx of idxs) {
         const key = encodeCompositeIndexKey(idx.columns, coerced, meta);
         await idx.insert(key, rid);
@@ -359,8 +357,7 @@ export class Engine {
     }
 
     let updated = 0;
-    let rid = 1;
-    for await (const { pageId, index, record, delete: del } of heap.scan()) {
+    for await (const { pageId, index, rid, record, delete: del } of heap.scan()) {
       void del;
       const row = deserializeRow(schema, record);
       const ctx = rowContext({ values: row, schema: meta.columns.map((c) => c.name), tables: [] });
@@ -393,7 +390,6 @@ export class Engine {
         await idx.insert(newKey, rid);
       }
       updated++;
-      rid++;
     }
     return { columns: [], rows: [], rowCount: updated, timeMs: performance.now() - t0 };
   }
@@ -407,8 +403,7 @@ export class Engine {
     const schema = { name: meta.name, columns: meta.columns };
 
     let deleted = 0;
-    let rid = 1;
-    for await (const { pageId, index, record, delete: del } of heap.scan()) {
+    for await (const { record, delete: del } of heap.scan()) {
       const row = deserializeRow(schema, record);
       const ctx = rowContext({ values: row, schema: meta.columns.map((c) => c.name), tables: [] });
       let match = true;
@@ -424,7 +419,6 @@ export class Engine {
         await del();
         deleted++;
       }
-      rid++;
     }
     return { columns: [], rows: [], rowCount: deleted, timeMs: performance.now() - t0 };
   }
@@ -434,10 +428,16 @@ export class Engine {
   private async doSelect(s: SelectStmt | SetOpStmt, opts: { explain?: boolean; analyze?: boolean }): Promise<QueryResult> {
     const t0 = performance.now();
     const tables = new Map<string, string[]>();
+    const indexesMap = new Map<string, IndexInfo[]>();
     for (const meta of this.catalog.dataValue.tables) {
       tables.set(meta.name.toLowerCase(), meta.columns.map((c) => c.name));
     }
-    const planner = new Planner({ tables });
+    for (const imeta of this.catalog.dataValue.indexes) {
+      const arr = indexesMap.get(imeta.table.toLowerCase()) ?? [];
+      arr.push({ name: imeta.name, columns: imeta.columns, unique: imeta.unique });
+      indexesMap.set(imeta.table.toLowerCase(), arr);
+    }
+    const planner = new Planner({ tables, indexes: indexesMap });
     const plan = planner.planSelect(s);
 
     const analyzeStats: { operator: string; rows: number; timeMs: number; pages: number }[] = [];
@@ -452,7 +452,7 @@ export class Engine {
         sub: import("../sql/ast.js").SubqueryStmt,
         outer: import("../expr/evaluator.js").EvalContext | null,
       ): Promise<import("../expr/evaluator.js").SubqueryRow[]> => {
-        const subPlanner = new Planner({ tables });
+        const subPlanner = new Planner({ tables, indexes: indexesMap });
         const subPlan = subPlanner.planSelect(sub);
         const subCtx: ExecContext = { ...ctx, outer };
         const subRoot = buildOperator(subPlan, subCtx);

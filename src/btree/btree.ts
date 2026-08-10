@@ -9,11 +9,11 @@ import { PAGE_SIZE, Page } from "../storage/page.js";
 // [10..11]  key count (n)
 // [12..13]  leaf: next leaf page id  │  internal: leftmost child lo half
 // [14..15]  internal: leftmost child hi half (leaf: 0)
-// [16..]    entries: { keyPtr u32, keyLen u32, then value u32 after key bytes }
-// [4090..4091] free space start (records grow downward from page end)
+// [16..17]  free space start (records grow downward from page end)
+// [18..]    entries: { keyPtr u32, keyLen u32, then value u32 after key bytes }
 
-export const BTREE_HEADER = 16;
-export const BTREE_FREE_PTR_OFF = 4090;
+export const BTREE_HEADER = 18;
+export const BTREE_FREE_PTR_OFF = 16;
 
 export type CompareFn = (a: Uint8Array, b: Uint8Array) => number;
 
@@ -61,6 +61,19 @@ export function encodeKeyNull(): Uint8Array {
   return new Uint8Array(9);
 }
 
+/** Encode a runtime value according to a column type ("int"|"real"|"text"|"boolean"). */
+export function encodeTypedKey(v: number | string | boolean | null, type: string): Uint8Array {
+  if (v === null) return encodeKeyNull();
+  switch (type) {
+    case "boolean":
+      return encodeKeyBoolean(v as boolean);
+    case "text":
+      return encodeKeyString(String(v));
+    default:
+      return encodeKeyNumber(Number(v));
+  }
+}
+
 /** Composite key: concatenation of typed parts, each 4-byte-length prefixed. */
 export function encodeCompositeKey(parts: Uint8Array[]): Uint8Array {
   let total = 0;
@@ -72,6 +85,42 @@ export function encodeCompositeKey(parts: Uint8Array[]): Uint8Array {
     off += 4;
     out.set(p, off);
     off += p.length;
+  }
+  return out;
+}
+
+/** Decode a single typed key back to its runtime value. */
+export function decodeTypedKey(bytes: Uint8Array): number | string | boolean | null {
+  if (bytes.length === 0) return null;
+  const tag = bytes[0];
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  switch (tag) {
+    case TAG_NULL:
+      return null;
+    case TAG_INT:
+      return Number(dv.getBigInt64(1, false));
+    case TAG_FLOAT:
+      return dv.getFloat64(1, false);
+    case TAG_STRING: {
+      const len = Number(dv.getBigUint64(1, false));
+      return new TextDecoder().decode(bytes.subarray(9, 9 + len));
+    }
+    case TAG_BOOL:
+      return bytes[1] !== 0;
+    default:
+      return null;
+  }
+}
+
+/** Split a composite key into its typed parts. */
+export function decodeCompositeKeyParts(c: Uint8Array): (number | string | boolean | null)[] {
+  const out: (number | string | boolean | null)[] = [];
+  let off = 0;
+  while (off < c.length) {
+    const len = new DataView(c.buffer, c.byteOffset + off, 8).getUint32(0, true);
+    off += 4;
+    out.push(decodeTypedKey(c.subarray(off, off + len)));
+    off += len;
   }
   return out;
 }
