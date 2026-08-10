@@ -810,12 +810,9 @@ export function buildOperator(plan: PlanNode, ctx: ExecContext): Operator {
       const p = plan as JoinNode;
       const left = buildOperator(p.children[0], ctx);
       const right = buildOperator(p.children[1], ctx);
-      if (p.on) {
-        // try hash join on equi-keys
-        const eq = extractEquiJoinKeys(p.on);
-        if (eq && p.joinType === "inner") {
-          return new HashJoinOperator(left, right, eq.leftKeys, eq.rightKeys, eq.extraOn, p.joinType);
-        }
+      const eq = p.equi === undefined ? extractEquiJoinKeys(p.on) : p.equi;
+      if (eq && p.joinType === "inner") {
+        return new HashJoinOperator(left, right, eq.leftKeys, eq.rightKeys, eq.extraOn, p.joinType);
       }
       return new NestedLoopJoinOperator(left, right, p.on, p.joinType, ctx);
     }
@@ -845,7 +842,8 @@ export function buildOperator(plan: PlanNode, ctx: ExecContext): Operator {
 }
 
 /** Extract equi-join keys from an ON expr: colA = colB. */
-function extractEquiJoinKeys(on: Expr): { leftKeys: Expr[]; rightKeys: Expr[]; extraOn: Expr | null } | null {
+function extractEquiJoinKeys(on: Expr | null): { leftKeys: Expr[]; rightKeys: Expr[]; extraOn: Expr | null } | null {
+  if (!on) return null;
   if (on.kind === "binop" && on.op === "=") {
     const l = on.left;
     const r = on.right;

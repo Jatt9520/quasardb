@@ -18,6 +18,8 @@ export interface PlannerContext {
   tables: Map<string, string[]>;
   /** table -> available indexes (from catalog) */
   indexes?: Map<string, IndexInfo[]>;
+  /** table -> estimated row count (from catalog/heap) */
+  sizes?: Map<string, number>;
 }
 
 export class PlannerError extends Error {}
@@ -44,33 +46,17 @@ export class Planner {
     if (!stmt.from) {
       root = { kind: "scan", table: "__single_row__", alias: "", columns: [], children: [], output: [] } as TableScanNode;
     } else {
-      root = this.planTableRef(stmt.from);
-      for (const join of stmt.joins) {
-        const right = this.planTableRef(join.ref);
-        root = {
-          kind: "join",
-          joinType: join.type === "cross" ? "cross" : join.type,
-          on: join.on,
-          children: [root, right],
-          output: [],
-        } as JoinNode;
-        this.computeOutput(root);
+      const plan = this.planFromAndWhere(stmt);
+      root = plan.root;
+      if (plan.residual.length > 0) {
+        const filter: FilterNode = {
+          kind: "filter",
+          expr: plan.residual.length === 1 ? plan.residual[0] : andExpr(plan.residual),
+          children: [root],
+          output: root.output,
+        };
+        root = filter;
       }
-    }
-
-    if (stmt.where) {
-      // single-table queries may use an index as the access path
-      if (stmt.from && stmt.from.kind === "table" && stmt.joins.length === 0) {
-        const idx = this.tryIndexScan(stmt);
-        if (idx) root = idx;
-      }
-      const filter: FilterNode = {
-        kind: "filter",
-        expr: stmt.where,
-        children: [root],
-        output: root.output,
-      };
-      root = filter;
     }
 
     const hasAggregates =
@@ -362,32 +348,255 @@ export class Planner {
     return null;
   }
 
-  /** Pick an index usable by the WHERE clause; returns an index scan node or null. */
-  private tryIndexScan(stmt: SelectStmt): IndexScanNode | null {
-    const ref = stmt.from;
-    if (!ref || ref.kind !== "table") return null;
+  /**
+   * Optimizer: attribute WHERE conjuncts to their table refs (predicate
+   * push-down), pick index access paths per table, and reorder inner/cross
+   * joins by estimated cardinality.
+   */
+  private planFromAndWhere(stmt: SelectStmt): { root: PlanNode; residual: Expr[] } {
+    const mkSlot = (ref: TableRef, joinType: RefSlot["joinType"], on: Expr | null): RefSlot => {
+      const alias = ref.kind === "table" ? (ref.alias ?? ref.table).toLowerCase() : ref.alias.toLowerCase();
+      const cols = ref.kind === "table" ? this.ctx.tables.get(ref.table.toLowerCase()) ?? [] : [];
+      return {
+        ref,
+        joinType,
+        on,
+        preds: [],
+        size: this.estRefRows(ref),
+        node: undefined as unknown as PlanNode,
+        alias,
+        cols,
+      };
+    };
+    const slots: RefSlot[] = [];
+    slots.push(mkSlot(stmt.from!, null, null));
+    for (const j of stmt.joins) {
+      slots.push(mkSlot(j.ref, j.type === "cross" ? "cross" : j.type, j.on));
+    }
+
+    // partition WHERE conjuncts; only refs before the first outer join may take
+    // pushed predicates (filters on the nullable side of an outer join must stay above it)
+    const residual: Expr[] = [];
+    if (stmt.where) {
+      const firstOuter = slots.findIndex((s, i) => i > 0 && (s.joinType === "left" || s.joinType === "right"));
+      const pushRange = firstOuter === -1 ? slots.length : firstOuter;
+      for (const c of splitAnd(stmt.where)) {
+        const owner = this.attributeExpr(c, slots);
+        if (owner !== null && owner < pushRange) {
+          slots[owner].preds.push(c);
+        } else {
+          residual.push(c);
+        }
+      }
+    }
+
+    // per-table access path + post-access filter
+    for (const s of slots) {
+      if (s.preds.length === 0) {
+        s.node = this.planTableRef(s.ref);
+        s.node.estRows = s.size;
+        continue;
+      }
+      const base = this.planTableRef(s.ref);
+      base.estRows = s.size;
+      const idx = this.tryIndexScan(s.ref, s.preds);
+      s.node = (idx ?? base) as PlanNode;
+      if (idx) s.node.estRows = Math.max(1, Math.round((s.size * 10) / Math.max(1, idx.prefix.length * 100 + 10)));
+      const filter: FilterNode = {
+        kind: "filter",
+        expr: s.preds.length === 1 ? s.preds[0] : andExpr(s.preds),
+        children: [s.node],
+        output: s.node.output,
+      };
+      filter.estRows = Math.max(1, Math.round((s.node.estRows ?? s.size) * Math.pow(0.3, s.preds.length)));
+      s.node = filter;
+    }
+
+    // reorder inner/cross joins by estimated row count (cheapest first);
+    // join edges (ON / join kind) keep their original left-to-right order;
+    // skip entirely when SELECT * would observe a different column order
+    const canReorder =
+      stmt.joins.every((j) => j.type === "inner" || j.type === "cross") &&
+      !stmt.items.some((i) => i.kind === "star");
+    if (canReorder) {
+      slots.sort((a, b) => (a.node.estRows ?? a.size) - (b.node.estRows ?? b.size));
+    }
+
+    let root = slots[0].node;
+    for (let i = 1; i < slots.length; i++) {
+      const s = slots[i];
+      const edge = stmt.joins[i - 1];
+      const join: JoinNode = {
+        kind: "join",
+        joinType: edge.type === "cross" ? "cross" : edge.type,
+        on: edge.on,
+        equi: edge.on ? this.allocEqui(edge.on, i, slots) : null,
+        children: [root, s.node],
+        output: [],
+      };
+      join.estRows = this.joinEstimate(join, s);
+      this.computeOutput(join);
+      root = join;
+    }
+    return { root, residual };
+  }
+
+  private estRefRows(ref: TableRef): number {
+    if (ref.kind === "subquery") return 100;
+    return this.ctx.sizes?.get(ref.table.toLowerCase()) ?? 10;
+  }
+
+  /**
+   * Split an ON expr into equi-join keys aligned with children[0] (root side,
+   * slots 0..rightIdx-1) and children[1] (slot rightIdx). Returns null when the
+   * expr cannot be safely attributed (e.g. unqualified columns).
+   */
+  private allocEqui(
+    on: Expr,
+    rightIdx: number,
+    slots: RefSlot[],
+  ): { leftKeys: Expr[]; rightKeys: Expr[]; extraOn: Expr | null } | null {
+    const side = (col: Expr): 0 | 1 | null => {
+      if (col.kind !== "col" || !col.table) return null;
+      const owner = slots.findIndex((s) => s.alias === col.table!.toLowerCase());
+      if (owner === -1) return null;
+      return owner === rightIdx ? 1 : 0;
+    };
+    if (on.kind === "binop" && on.op === "=") {
+      const ls = side(on.left);
+      const rs = side(on.right);
+      if (ls === null || rs === null || ls === rs) return null;
+      return ls === 0
+        ? { leftKeys: [on.left], rightKeys: [on.right], extraOn: null }
+        : { leftKeys: [on.right], rightKeys: [on.left], extraOn: null };
+    }
+    if (on.kind === "binop" && on.op === "and") {
+      const p1 = this.allocEqui(on.left, rightIdx, slots);
+      const p2 = this.allocEqui(on.right, rightIdx, slots);
+      if (p1 && p2) {
+        return {
+          leftKeys: [...p1.leftKeys, ...p2.leftKeys],
+          rightKeys: [...p1.rightKeys, ...p2.rightKeys],
+          extraOn: null,
+        };
+      }
+      if (p1) return { ...p1, extraOn: on.right };
+      if (p2) return { ...p2, extraOn: on.left };
+      return null;
+    }
+    return null;
+  }
+
+  private joinEstimate(join: JoinNode, right: RefSlot): number {
+    const l = join.children[0].estRows ?? 10;
+    const r = right.node.estRows ?? right.size;
+    switch (join.joinType) {
+      case "cross":
+        return l * r;
+      case "inner":
+        return Math.max(1, Math.round(l * r * 0.1));
+      case "left":
+        return l + Math.round(l * r * 0.5);
+      case "right":
+        return r + Math.round(r * l * 0.5);
+    }
+  }
+
+  /**
+   * Attribute a conjunct to exactly one table ref. Returns the slot index, or
+   * null when the conjunct references more than one ref / unknown columns.
+   */
+  private attributeExpr(e: Expr, slots: RefSlot[]): number | null {
+    const owner = new Set<number>();
+    let unknown = false;
+    (function walk(x: Expr): void {
+      switch (x.kind) {
+        case "col": {
+          if (x.table) {
+            const idx = slots.findIndex((s) => s.alias === x.table!.toLowerCase());
+            if (idx < 0) unknown = true;
+            else owner.add(idx);
+          } else {
+            const matches = slots
+              .map((s, i) => ({ s, i }))
+              .filter(({ s }) => s.cols.some((c) => c.toLowerCase() === x.name.toLowerCase()));
+            if (matches.length === 1) owner.add(matches[0].i);
+            else unknown = true;
+          }
+          break;
+        }
+        case "binop":
+          walk(x.left);
+          walk(x.right);
+          break;
+        case "unop":
+          walk(x.operand);
+          break;
+        case "func":
+          for (const a of x.args) walk(a);
+          break;
+        case "case":
+          if (x.operand) walk(x.operand);
+          for (const w of x.whens) {
+            walk(w.when);
+            walk(w.then);
+          }
+          if (x.els) walk(x.els);
+          break;
+        case "cast":
+          walk(x.expr);
+          break;
+        case "between":
+          walk(x.expr);
+          walk(x.low);
+          walk(x.high);
+          break;
+        case "like":
+          walk(x.expr);
+          walk(x.pattern);
+          break;
+        case "in":
+          walk(x.expr);
+          for (const v of x.list ?? []) walk(v);
+          break;
+        case "is":
+        case "isnull":
+          walk(x.expr);
+          break;
+        default:
+          break;
+      }
+    })(e);
+    if (!unknown && owner.size === 1) return [...owner][0];
+    return null;
+  }
+
+  /** Pick an index usable by the given predicates; returns an index scan node or null. */
+  private tryIndexScan(ref: TableRef, preds: Expr[]): IndexScanNode | null {
+    if (ref.kind !== "table") return null;
     const tableKey = ref.table.toLowerCase();
     const alias = (ref.alias ?? ref.table).toLowerCase();
     const tCols = this.ctx.tables.get(tableKey) ?? [];
-    const preds: IndexPred[] = [];
-    for (const c of splitAnd(stmt.where!)) {
-      const p = asIndexPred(c, tCols, alias);
-      if (p) preds.push(p);
-    }
-    if (preds.length === 0) return null;
     const candidates = this.ctx.indexes?.get(tableKey) ?? [];
+    if (candidates.length === 0) return null;
+    const indexed: IndexPred[] = [];
+    for (const c of preds) {
+      const p = asIndexPred(c, tCols, alias);
+      if (p) indexed.push(p);
+    }
+    if (indexed.length === 0) return null;
     let best: { name: string; prefix: IndexPred[]; range: IndexPred | null; score: number } | null = null;
     for (const info of candidates) {
       const prefix: IndexPred[] = [];
       let range: IndexPred | null = null;
       for (const col of info.columns) {
         const c = col.toLowerCase();
-        const eq = preds.find((p) => p.col === c && p.op === "eq");
+        const eq = indexed.find((p) => p.col === c && p.op === "eq");
         if (eq) {
           prefix.push(eq);
           continue;
         }
-        const r = preds.find((p) => p.col === c && p.op !== "eq");
+        const r = indexed.find((p) => p.col === c && p.op !== "eq");
         if (r && !range) range = r;
         break;
       }
@@ -589,6 +798,26 @@ interface IndexPred {
   col: string;
   op: "eq" | "gt" | "ge" | "lt" | "le" | "between" | "in";
   values: Value[];
+}
+
+/** A FROM/JOIN table reference and the predicates pushed down to it. */
+interface RefSlot {
+  ref: TableRef;
+  joinType: "inner" | "left" | "right" | "cross" | null;
+  on: Expr | null;
+  preds: Expr[];
+  size: number;
+  node: PlanNode;
+  readonly alias: string;
+  readonly cols: string[];
+}
+
+function andExpr(parts: Expr[]): Expr {
+  let root: Expr = parts[0];
+  for (let i = 1; i < parts.length; i++) {
+    root = { kind: "binop", op: "and", left: root, right: parts[i] };
+  }
+  return root;
 }
 
 function splitAnd(e: Expr): Expr[] {

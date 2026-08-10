@@ -429,15 +429,18 @@ export class Engine {
     const t0 = performance.now();
     const tables = new Map<string, string[]>();
     const indexesMap = new Map<string, IndexInfo[]>();
+    const sizes = new Map<string, number>();
     for (const meta of this.catalog.dataValue.tables) {
       tables.set(meta.name.toLowerCase(), meta.columns.map((c) => c.name));
+      const heap = this.heaps.get(meta.name.toLowerCase());
+      sizes.set(meta.name.toLowerCase(), heap ? await heap.recordCount() : 0);
     }
     for (const imeta of this.catalog.dataValue.indexes) {
       const arr = indexesMap.get(imeta.table.toLowerCase()) ?? [];
       arr.push({ name: imeta.name, columns: imeta.columns, unique: imeta.unique });
       indexesMap.set(imeta.table.toLowerCase(), arr);
     }
-    const planner = new Planner({ tables, indexes: indexesMap });
+    const planner = new Planner({ tables, indexes: indexesMap, sizes });
     const plan = planner.planSelect(s);
 
     const analyzeStats: { operator: string; rows: number; timeMs: number; pages: number }[] = [];
@@ -452,7 +455,7 @@ export class Engine {
         sub: import("../sql/ast.js").SubqueryStmt,
         outer: import("../expr/evaluator.js").EvalContext | null,
       ): Promise<import("../expr/evaluator.js").SubqueryRow[]> => {
-        const subPlanner = new Planner({ tables, indexes: indexesMap });
+        const subPlanner = new Planner({ tables, indexes: indexesMap, sizes });
         const subPlan = subPlanner.planSelect(sub);
         const subCtx: ExecContext = { ...ctx, outer };
         const subRoot = buildOperator(subPlan, subCtx);

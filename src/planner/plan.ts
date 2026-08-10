@@ -51,6 +51,8 @@ export interface JoinNode extends PlanNode {
   kind: "join";
   joinType: "inner" | "left" | "right" | "cross";
   on: Expr | null;
+  /** pre-assigned equi-join keys, keyed to children[0] / children[1] */
+  equi?: { leftKeys: Expr[]; rightKeys: Expr[]; extraOn: Expr | null } | null;
   children: [PlanNode, PlanNode];
 }
 
