@@ -2,7 +2,7 @@ import { Lexer, Token } from "./lexer.js";
 import {
   ColumnDef, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
   DropTableStmt, Expr, InsertStmt, JoinClause, Literal, OrderByItem, ParseResult,
-  SelectItem, SelectStmt, SqlType, Statement, TableRef, UpdateStmt,
+  SelectItem, SelectStmt, SetOpStmt, SqlType, Statement, TableRef, UpdateStmt,
 } from "./ast.js";
 
 export class ParseError extends Error {
@@ -308,7 +308,62 @@ class Parser {
 
   // ------------------------------------------------------------------
 
-  private parseSelect(): SelectStmt {
+  private parseSelect(): SelectStmt | SetOpStmt {
+    let root: SelectStmt | SetOpStmt = this.parseSelectCore();
+    for (;;) {
+      let op: "union" | "intersect" | "except" | null = null;
+      if (this.isKeyword("union")) {
+        this.next();
+        op = "union";
+      } else if (this.isKeyword("intersect")) {
+        this.next();
+        op = "intersect";
+      } else if (this.isKeyword("except")) {
+        this.next();
+        op = "except";
+      }
+      if (!op) break;
+      const all = this.matchKeyword("all");
+      const right = this.parseSelectCore();
+      root = { kind: "setop", op, all, left: root, right, orderBy: [], limit: null, offset: null };
+    }
+    const orderBy: OrderByItem[] = [];
+    if (this.matchKeyword("order")) {
+      this.expectKeyword("by");
+      for (;;) {
+        const expr = this.parseExpression();
+        let desc = false;
+        if (this.isKeyword("asc")) this.next();
+        else if (this.isKeyword("desc")) {
+          this.next();
+          desc = true;
+        }
+        orderBy.push({ expr, desc });
+        if (this.isOp(",")) {
+          this.next();
+          continue;
+        }
+        break;
+      }
+    }
+    let limit: Expr | null = null;
+    if (this.matchKeyword("limit")) limit = this.parseExpression();
+    let offset: Expr | null = null;
+    if (this.matchKeyword("offset")) offset = this.parseExpression();
+    if (root.kind === "setop") {
+      root.orderBy = orderBy;
+      root.limit = limit;
+      root.offset = offset;
+      return root;
+    }
+    root.orderBy = orderBy;
+    root.limit = limit;
+    root.offset = offset;
+    return root;
+  }
+
+  /** SELECT ... HAVING, without ORDER BY / LIMIT (those belong to a set-op tail). */
+  private parseSelectCore(): SelectStmt {
     this.expectKeyword("select");
     const distinct = this.matchKeyword("distinct");
     const items: SelectItem[] = [];
@@ -389,32 +444,7 @@ class Parser {
     let having: Expr | null = null;
     if (this.matchKeyword("having")) having = this.parseExpression();
 
-    const orderBy: OrderByItem[] = [];
-    if (this.matchKeyword("order")) {
-      this.expectKeyword("by");
-      for (;;) {
-        const expr = this.parseExpression();
-        let desc = false;
-        if (this.isKeyword("asc")) this.next();
-        else if (this.isKeyword("desc")) {
-          this.next();
-          desc = true;
-        }
-        orderBy.push({ expr, desc });
-        if (this.isOp(",")) {
-          this.next();
-          continue;
-        }
-        break;
-      }
-    }
-
-    let limit: Expr | null = null;
-    if (this.matchKeyword("limit")) limit = this.parseExpression();
-    let offset: Expr | null = null;
-    if (this.matchKeyword("offset")) offset = this.parseExpression();
-
-    return { kind: "select", distinct, items, from, joins, where, groupBy, having, orderBy, limit, offset };
+    return { kind: "select", distinct, items, from, joins, where, groupBy, having, orderBy: [], limit: null, offset: null };
   }
 
   private parseTableRef(): TableRef {

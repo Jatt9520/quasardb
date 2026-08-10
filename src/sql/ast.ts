@@ -77,13 +77,26 @@ export interface SelectStmt {
   offset: Expr | null;
 }
 
+export interface SetOpStmt {
+  kind: "setop";
+  op: "union" | "intersect" | "except";
+  all: boolean;
+  left: SelectStmt | SetOpStmt;
+  right: SelectStmt | SetOpStmt;
+  orderBy: OrderByItem[];
+  limit: Expr | null;
+  offset: Expr | null;
+}
+
+export type SubqueryStmt = SelectStmt | SetOpStmt;
+
 export type SelectItem =
   | { kind: "star" }
   | { kind: "expr"; expr: Expr; alias: string | null };
 
 export type TableRef =
   | { kind: "table"; table: string; alias: string | null }
-  | { kind: "subquery"; query: SelectStmt; alias: string };
+  | { kind: "subquery"; query: SubqueryStmt; alias: string };
 
 export interface JoinClause {
   type: "inner" | "left" | "right" | "cross";
@@ -104,18 +117,19 @@ export type Expr =
   | { kind: "func"; name: string; args: Expr[]; distinct?: boolean; star?: boolean }
   | { kind: "case"; operand: Expr | null; whens: { when: Expr; then: Expr }[]; els: Expr | null }
   | { kind: "cast"; expr: Expr; type: SqlType }
-  | { kind: "exists"; subquery: SelectStmt; negated: boolean }
-  | { kind: "in"; expr: Expr; subquery: SelectStmt | null; list: Expr[] | null; negated: boolean }
+  | { kind: "exists"; subquery: SubqueryStmt; negated: boolean }
+  | { kind: "in"; expr: Expr; subquery: SubqueryStmt | null; list: Expr[] | null; negated: boolean }
   | { kind: "between"; expr: Expr; low: Expr; high: Expr; negated: boolean }
   | { kind: "like"; expr: Expr; pattern: Expr; negated: boolean }
   | { kind: "isnull"; expr: Expr; negated: boolean }
   | { kind: "is"; expr: Expr; value: Literal | null; negated: boolean }
-  | { kind: "scalar"; subquery: SelectStmt };
+  | { kind: "scalar"; subquery: SubqueryStmt };
 
 export type Literal = number | string | boolean | null;
 
 export type Statement =
   | SelectStmt
+  | SetOpStmt
   | InsertStmt
   | UpdateStmt
   | DeleteStmt

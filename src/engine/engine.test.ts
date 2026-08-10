@@ -143,6 +143,23 @@ describe("JOINs", () => {
 });
 
 describe("subqueries", () => {
+  it("derived table in FROM", async () => {
+    const r = await q(
+      "SELECT t.name FROM (SELECT name, age FROM users WHERE age > 24) AS t ORDER BY t.age",
+    );
+    expect(r.rows).toEqual([["bob"], ["alice"], ["carol"], ["alice"]]);
+    const r2 = await q(
+      "SELECT t.n FROM (SELECT count(*) AS n FROM orders) AS t WHERE t.n > 0",
+    );
+    expect(r2.rows).toEqual([[3]]);
+    const r3 = await q(
+      "SELECT a.name, b.cnt FROM users a JOIN (SELECT user_id, count(*) AS cnt FROM orders GROUP BY user_id) AS b ON a.id = b.user_id ORDER BY a.id",
+    );
+    expect(r3.rows).toEqual([
+      ["alice", 1],
+      ["bob", 1],
+    ]);
+  });
   it("IN (subquery) and NOT IN", async () => {
     const r = await q("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders) ORDER BY id");
     expect(r.rows).toEqual([["alice"], ["bob"]]);
@@ -185,6 +202,59 @@ describe("subqueries", () => {
       ["carol", 0],
       ["alice", 0],
     ]);
+  });
+});
+
+describe("set operations", () => {
+  it("UNION dedupes and UNION ALL keeps duplicates", async () => {
+    const r = await q("SELECT name FROM users WHERE age >= 25 UNION SELECT name FROM users WHERE name LIKE 'a%' ORDER BY name");
+    expect(r.rows).toEqual([["alice"], ["bob"], ["carol"]]);
+    const r2 = await q("SELECT name FROM users WHERE age >= 25 UNION ALL SELECT name FROM users WHERE name LIKE 'a%' ORDER BY name");
+    expect(r2.rows).toEqual([
+      ["alice"], ["alice"], ["alice"], ["alice"], ["bob"], ["carol"],
+    ]);
+  });
+
+  it("INTERSECT / INTERSECT ALL", async () => {
+    const r = await q("SELECT name FROM users WHERE age >= 25 INTERSECT SELECT name FROM users WHERE name LIKE 'a%' ORDER BY name");
+    expect(r.rows).toEqual([["alice"]]);
+    const r2 = await q("SELECT name FROM users WHERE name LIKE 'a%' INTERSECT ALL SELECT name FROM users WHERE name LIKE 'a%' ORDER BY name");
+    expect(r2.rows).toEqual([["alice"], ["alice"]]);
+  });
+
+  it("EXCEPT / EXCEPT ALL", async () => {
+    const r = await q("SELECT name FROM users WHERE age >= 25 EXCEPT SELECT name FROM users WHERE name LIKE 'a%' ORDER BY name");
+    expect(r.rows).toEqual([["bob"], ["carol"]]);
+    const r2 = await q("SELECT name FROM users WHERE name LIKE 'a%' EXCEPT ALL SELECT name FROM users WHERE name = 'nobody' ORDER BY name");
+    expect(r2.rows).toEqual([["alice"], ["alice"]]);
+    const r3 = await q("SELECT name FROM users WHERE name LIKE 'a%' EXCEPT ALL SELECT name FROM users WHERE name LIKE 'a%'");
+    expect(r3.rowCount).toBe(0);
+  });
+
+  it("set ops combine columns and mixed-table operands", async () => {
+    await q("CREATE TABLE left_t (v INTEGER)");
+    await q("CREATE TABLE right_t (v INTEGER)");
+    await q("INSERT INTO left_t VALUES (1), (2), (3)");
+    await q("INSERT INTO right_t VALUES (2), (3), (4)");
+    const u = await q("SELECT v FROM left_t UNION SELECT v FROM right_t ORDER BY v");
+    expect(u.rows).toEqual([[1], [2], [3], [4]]);
+    const i = await q("SELECT v FROM left_t INTERSECT SELECT v FROM right_t ORDER BY v");
+    expect(i.rows).toEqual([[2], [3]]);
+    const e = await q("SELECT v FROM left_t EXCEPT SELECT v FROM right_t ORDER BY v");
+    expect(e.rows).toEqual([[1]]);
+  });
+
+  it("rejects mismatched column counts", async () => {
+    await expect(q("SELECT name, age FROM users UNION SELECT name FROM users")).rejects.toThrow(/same number of columns/);
+  });
+
+  it("supports set ops in derived tables and subqueries", async () => {
+    const r = await q(
+      "SELECT t.v FROM (SELECT v FROM left_t UNION SELECT v FROM right_t) AS t WHERE t.v > 2 ORDER BY t.v",
+    );
+    expect(r.rows).toEqual([[3], [4]]);
+    const r2 = await q("SELECT v FROM left_t WHERE v IN (SELECT v FROM right_t UNION SELECT v FROM left_t WHERE v = 5) ORDER BY v");
+    expect(r2.rows).toEqual([[2], [3]]);
   });
 });
 

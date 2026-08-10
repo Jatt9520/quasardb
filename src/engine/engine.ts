@@ -3,7 +3,7 @@ import { Catalog, TableMeta, IndexMeta } from "../storage/catalog.js";
 import { BtreeIndex, compareKeys, encodeCompositeKey, encodeKeyBoolean, encodeKeyNull, encodeKeyNumber, encodeKeyString, keyToString } from "../btree/btree.js";
 import { TableHeap } from "../storage/tableHeap.js";
 import {
-  ColumnDef, DeleteStmt, Expr, InsertStmt, SelectStmt, SqlType, Statement,
+  ColumnDef, DeleteStmt, Expr, InsertStmt, SelectStmt, SetOpStmt, SqlType, Statement,
   UpdateStmt, CreateTableStmt, CreateIndexStmt, DropTableStmt, DropIndexStmt,
 } from "../sql/ast.js";
 import { Planner } from "../planner/planner.js";
@@ -106,6 +106,8 @@ export class Engine {
       case "delete":
         return this.doDelete(statement);
       case "select":
+        return this.doSelect(statement, opts);
+      case "setop":
         return this.doSelect(statement, opts);
     }
   }
@@ -384,7 +386,7 @@ export class Engine {
 
   // ---------------- SELECT ----------------
 
-  private async doSelect(s: SelectStmt, opts: { explain?: boolean; analyze?: boolean }): Promise<QueryResult> {
+  private async doSelect(s: SelectStmt | SetOpStmt, opts: { explain?: boolean; analyze?: boolean }): Promise<QueryResult> {
     const t0 = performance.now();
     const tables = new Map<string, string[]>();
     for (const meta of this.catalog.dataValue.tables) {
@@ -402,7 +404,7 @@ export class Engine {
     };
     ctx.subquery = {
       run: async (
-        sub: SelectStmt,
+        sub: import("../sql/ast.js").SubqueryStmt,
         outer: import("../expr/evaluator.js").EvalContext | null,
       ): Promise<import("../expr/evaluator.js").SubqueryRow[]> => {
         const subPlanner = new Planner({ tables });

@@ -27,7 +27,7 @@ export interface FilterNode extends PlanNode {
 
 export interface ProjectNode extends PlanNode {
   kind: "project";
-  exprs: { expr: Expr; out: string | null }[];
+  exprs: { expr: Expr; out: string | null; table?: string }[];
   children: [PlanNode];
 }
 
@@ -62,6 +62,13 @@ export interface LimitNode extends PlanNode {
 export interface DistinctNode extends PlanNode {
   kind: "distinct";
   children: [PlanNode];
+}
+
+export interface SetOpNode extends PlanNode {
+  kind: "setop";
+  op: "union" | "intersect" | "except";
+  all: boolean;
+  children: [PlanNode, PlanNode];
 }
 
 export type AnyPlan = PlanNode;
@@ -103,6 +110,11 @@ export function planToString(plan: PlanNode, indent = 0): string {
       break;
     case "project":
       break;
+    case "setop": {
+      const p = plan as SetOpNode;
+      s += ` ${p.op.toUpperCase()}${p.all ? " ALL" : ""}`;
+      break;
+    }
   }
   if (plan.estRows !== undefined) s += ` (~${plan.estRows} rows)`;
   for (const c of plan.children) s += "\n" + planToString(c, indent + 1);

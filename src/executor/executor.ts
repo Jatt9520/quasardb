@@ -6,7 +6,7 @@ import { Value, compareValues, truthy, valueHashKey } from "../expr/value.js";
 import { containsSubquery, evalExpr, evalExprAsync, SubqueryRunner } from "../expr/evaluator.js";
 import { TableMeta } from "../storage/catalog.js";
 import { deserializeRow, Schema, schemaOf } from "../storage/record.js";
-import { AggregateNode, DistinctNode, FilterNode, JoinNode, LimitNode, PlanNode, ProjectNode, SortNode, TableScanNode } from "../planner/plan.js";
+import { AggregateNode, DistinctNode, FilterNode, JoinNode, LimitNode, PlanNode, ProjectNode, SetOpNode, SortNode, TableScanNode } from "../planner/plan.js";
 
 // ========================= Row model =========================
 
@@ -179,7 +179,7 @@ export class ProjectOperator extends BaseOperator {
       const v = await evalFilterExpr(item.expr, row, this.ctx);
       values.push(v);
       names.push(item.out ?? "");
-      tables.push("");
+      tables.push(item.table ?? "");
     }
     return makeRow(values, names, tables);
   }
@@ -609,6 +609,97 @@ export class DistinctOperator extends BaseOperator {
   }
 }
 
+export class SetOpOperator extends BaseOperator {
+  constructor(
+    private left: Operator,
+    private right: Operator,
+    private op: "union" | "intersect" | "except",
+    private all: boolean,
+  ) {
+    super();
+  }
+
+  private unionLeftDone = false;
+  private seen = new Set<string>();
+  private rightCounts: Map<string, number> | null = null;
+  private emitted = new Set<string>();
+
+  private key(row: Row): string {
+    return row.values.map(valueHashKey).join("#");
+  }
+
+  private async loadRight(): Promise<void> {
+    this.rightCounts = new Map();
+    for (;;) {
+      const row = await this.right.next();
+      if (!row) break;
+      const k = this.key(row);
+      this.rightCounts.set(k, (this.rightCounts.get(k) ?? 0) + 1);
+    }
+    await this.right.close();
+  }
+
+  async nextInner(): Promise<Row | null> {
+    if (this.op === "union") {
+      for (;;) {
+        if (!this.unionLeftDone) {
+          const row = await this.left.next();
+          if (row) {
+            const k = this.key(row);
+            if (!this.all && this.seen.has(k)) continue;
+            this.seen.add(k);
+            return row;
+          }
+          this.unionLeftDone = true;
+          await this.left.close();
+          continue;
+        }
+        const row = await this.right.next();
+        if (!row) return null;
+        const k = this.key(row);
+        if (!this.all && this.seen.has(k)) continue;
+        this.seen.add(k);
+        return row;
+      }
+    }
+    if (this.rightCounts === null) await this.loadRight();
+    for (;;) {
+      const row = await this.left.next();
+      if (!row) return null;
+      const k = this.key(row);
+      const cnt = this.rightCounts!.get(k) ?? 0;
+      if (this.op === "intersect") {
+        if (this.all) {
+          if (cnt === 0) continue;
+          this.rightCounts!.set(k, cnt - 1);
+          return row;
+        }
+        if (cnt > 0 && !this.emitted.has(k)) {
+          this.emitted.add(k);
+          return row;
+        }
+      } else {
+        if (this.all) {
+          if (cnt > 0) {
+            this.rightCounts!.set(k, cnt - 1);
+            continue;
+          }
+          return row;
+        }
+        if (cnt === 0 && !this.emitted.has(k)) {
+          this.emitted.add(k);
+          return row;
+        }
+      }
+    }
+  }
+
+  override async close(): Promise<void> {
+    await this.left.close();
+    if (this.rightCounts === null) await this.right.close();
+  }
+}
+
 // ========================= Builder =========================
 
 export function buildOperator(plan: PlanNode, ctx: ExecContext): Operator {
@@ -651,6 +742,10 @@ export function buildOperator(plan: PlanNode, ctx: ExecContext): Operator {
     case "distinct": {
       const p = plan as DistinctNode;
       return new DistinctOperator(buildOperator(p.children[0], ctx));
+    }
+    case "setop": {
+      const p = plan as SetOpNode;
+      return new SetOpOperator(buildOperator(p.children[0], ctx), buildOperator(p.children[1], ctx), p.op, p.all);
     }
     default:
       throw new Error(`Unsupported plan node "${(plan as PlanNode).kind}"`);

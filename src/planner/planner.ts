@@ -1,7 +1,7 @@
-import type { Expr, Literal, SelectStmt, SqlType, TableRef } from "../sql/ast.js";
+import type { Expr, Literal, SelectStmt, SetOpStmt, SqlType, TableRef } from "../sql/ast.js";
 import {
   AggregateNode, DistinctNode, FilterNode, JoinNode, LimitNode, PlanNode,
-  ProjectNode, SortNode, TableScanNode,
+  ProjectNode, SetOpNode, SortNode, TableScanNode,
 } from "./plan.js";
 import { isAggregateCall } from "./plan.js";
 
@@ -13,7 +13,7 @@ export interface PlannerContext {
 export class PlannerError extends Error {}
 
 /**
- * Builds a logical plan from a SELECT AST:
+ * Builds a logical plan from a SELECT / set-op AST:
  *   scan → join → filter → (aggregate → relabel) → project → distinct → sort → limit
  */
 export class Planner {
@@ -23,7 +23,12 @@ export class Planner {
     this.ctx = ctx;
   }
 
-  planSelect(stmt: SelectStmt): PlanNode {
+  planSelect(stmt: SelectStmt | SetOpStmt): PlanNode {
+    if (stmt.kind === "setop") return this.planSetOp(stmt);
+    return this.planSelectCore(stmt);
+  }
+
+  private planSelectCore(stmt: SelectStmt): PlanNode {
     let root: PlanNode;
 
     if (!stmt.from) {
@@ -102,6 +107,41 @@ export class Planner {
       root = lim;
     }
 
+    return root;
+  }
+
+  private planSetOp(stmt: SetOpStmt): PlanNode {
+    const left = this.planSelect(stmt.left);
+    const right = this.planSelect(stmt.right);
+    if (left.output.length !== right.output.length) {
+      throw new PlannerError(
+        `Set operation requires the same number of columns on both sides (${left.output.length} vs ${right.output.length})`,
+      );
+    }
+    let root: PlanNode = {
+      kind: "setop",
+      op: stmt.op,
+      all: stmt.all,
+      children: [left, right],
+      output: left.output,
+    } as SetOpNode;
+    if (stmt.orderBy.length > 0) {
+      const sort: SortNode = {
+        kind: "sort",
+        by: stmt.orderBy.map((o) => ({ expr: o.expr, desc: o.desc })),
+        children: [root],
+        output: root.output,
+      };
+      root = sort;
+    }
+    let limit: number | null = null;
+    let offset = 0;
+    if (stmt.limit) limit = Math.trunc(Number(this.constEval(stmt.limit) ?? 0));
+    if (stmt.offset) offset = Math.trunc(Number(this.constEval(stmt.offset) ?? 0));
+    if (limit !== null || offset > 0) {
+      const lim: LimitNode = { kind: "limit", limit, offset, children: [root], output: root.output };
+      root = lim;
+    }
     return root;
   }
 
@@ -310,7 +350,19 @@ export class Planner {
   private planTableRef(ref: TableRef): PlanNode {
     if (ref.kind === "subquery") {
       const subPlanner = new Planner(this.ctx);
-      return subPlanner.planSelect(ref.query);
+      const subPlan = subPlanner.planSelect(ref.query);
+      // rename the derived table's columns onto its alias
+      const proj: ProjectNode = {
+        kind: "project",
+        exprs: subPlan.output.map((name) => ({
+          expr: { kind: "col", table: null, name },
+          out: name,
+          table: ref.alias,
+        })),
+        children: [subPlan],
+        output: subPlan.output,
+      };
+      return proj;
     }
     const cols = this.ctx.tables.get(ref.table.toLowerCase()) ?? [];
     const node: TableScanNode = {
@@ -337,6 +389,9 @@ export class Planner {
         break;
       }
       case "filter":
+        n.output = n.children[0].output;
+        break;
+      case "setop":
         n.output = n.children[0].output;
         break;
       default:

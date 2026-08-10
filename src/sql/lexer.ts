@@ -23,6 +23,7 @@ const KEYWORDS = new Set([
   "is", "between", "asc", "desc", "distinct", "exists", "if",
   "int", "integer", "bigint", "real", "double", "text", "varchar",
   "boolean", "bool", "blob", "auto_increment", "explain", "analyze",
+  "union", "intersect", "except", "all",
 ]);
 
 const TWO_CHAR_OPS = ["<=", ">=", "<>", "!=", "||", "::"];

@@ -1,4 +1,4 @@
-import { Expr, SelectStmt, SqlType } from "../sql/ast.js";
+import { Expr, SqlType, SubqueryStmt } from "../sql/ast.js";
 import { Value, NULL, binaryOperands, bool, compareValues, num, sqlTypeOf, truthy, valueHashKey } from "./value.js";
 
 export interface RowMetadata {
@@ -213,7 +213,7 @@ export interface SubqueryRow {
 
 /** Executes a subquery SELECT against the engine. */
 export interface SubqueryRunner {
-  run(sub: SelectStmt, outer: EvalContext | null): Promise<SubqueryRow[]>;
+  run(sub: SubqueryStmt, outer: EvalContext | null): Promise<SubqueryRow[]>;
 }
 
 /** True when the expression contains EXISTS or IN (subquery) nodes. */
@@ -645,13 +645,13 @@ function evalScalarFunc(name: string, expr: Extract<Expr, { kind: "func" }>, row
 }
 
 /** Evaluate a scalar subquery (IN (...) with subquery, EXISTS). */
-function evalInSubquery(v: Value, sub: SelectStmt, negated: boolean, outer: EvalContext): Value {
+function evalInSubquery(v: Value, sub: SubqueryStmt, negated: boolean, outer: EvalContext): Value {
   // Note: full correlated-subquery support drops into the executor; this path
   // is used by the planner only for uncorrelated checks.
   throw new EvalError("Subquery evaluation requires executor context");
 }
 
-function subqueryHasRows(sub: SelectStmt, outer: EvalContext): boolean {
+function subqueryHasRows(sub: SubqueryStmt, outer: EvalContext): boolean {
   throw new EvalError("Subquery evaluation requires executor context");
 }
 
