@@ -1,5 +1,5 @@
 import { BufferPool } from "../storage/bufferPool.js";
-import { Catalog, TableMeta, IndexMeta } from "../storage/catalog.js";
+import { Catalog, CatalogData, TableMeta, IndexMeta } from "../storage/catalog.js";
 import { BtreeIndex, compareKeys, encodeCompositeKey, encodeKeyBoolean, encodeKeyNull, encodeKeyNumber, encodeKeyString, keyToString } from "../btree/btree.js";
 import { TableHeap } from "../storage/tableHeap.js";
 import {
@@ -28,6 +28,7 @@ export class Engine {
   private heaps = new Map<string, TableHeap>();
   private metas = new Map<string, TableMeta>();
   private indexes = new Map<string, BtreeIndex[]>();
+  private txnCatalog: CatalogData | null = null;
 
   private constructor(pool: BufferPool, catalog: Catalog) {
     this.pool = pool;
@@ -109,7 +110,51 @@ export class Engine {
         return this.doSelect(statement, opts);
       case "setop":
         return this.doSelect(statement, opts);
+      case "begin":
+        return this.doBegin();
+      case "commit":
+        return this.doCommit();
+      case "rollback":
+        return this.doRollback();
     }
+  }
+
+  get inTransaction(): boolean {
+    return this.txnCatalog !== null;
+  }
+
+  private doBegin(): QueryResult {
+    if (this.txnCatalog) throw new Error("already in a transaction");
+    this.txnCatalog = JSON.parse(JSON.stringify(this.catalog.dataValue)) as CatalogData;
+    this.pool.beginUndo();
+    return { columns: [], rows: [], rowCount: 0, timeMs: 0 };
+  }
+
+  private async doCommit(): Promise<QueryResult> {
+    if (!this.txnCatalog) throw new Error("no transaction in progress");
+    this.txnCatalog = null;
+    this.pool.commitUndo();
+    await this.syncAll();
+    return { columns: [], rows: [], rowCount: 0, timeMs: 0 };
+  }
+
+  private async doRollback(): Promise<QueryResult> {
+    if (!this.txnCatalog) throw new Error("no transaction in progress");
+    const snapshot = this.txnCatalog;
+    this.txnCatalog = null;
+    await this.pool.rollbackUndo();
+    this.catalog.restore(snapshot);
+    await this.commitCatalog();
+    await this.syncAll();
+    this.refreshState();
+    return { columns: [], rows: [], rowCount: 0, timeMs: 0 };
+  }
+
+  private refreshState(): void {
+    this.heaps.clear();
+    this.metas.clear();
+    this.indexes.clear();
+    this.loadState();
   }
 
   // ---------------- DDL ----------------

@@ -15,6 +15,7 @@ export class BufferPool {
   private capacity: number;
   private clockHand = 0;
   private nextPageId: number;
+  private undo: Map<number, Uint8Array> | null = null;
 
   /** stats for the visualization dashboard */
   readonly stats = {
@@ -55,6 +56,9 @@ export class BufferPool {
       existing.pin++;
       existing.clock = true;
       this.stats.hits++;
+      if (this.undo && !this.undo.has(pageId)) {
+        this.undo.set(pageId, existing.page.data.slice());
+      }
       return existing.page;
     }
     this.stats.misses++;
@@ -67,6 +71,9 @@ export class BufferPool {
     const frame: Frame = { page, dirty: false, clock: true, pin: 1 };
     this.frames.set(pageId, frame);
     this.stats.totalPins++;
+    if (this.undo && !this.undo.has(pageId)) {
+      this.undo.set(pageId, raw.slice());
+    }
     return page;
   }
 
@@ -140,5 +147,36 @@ export class BufferPool {
   async close(): Promise<void> {
     await this.flushAll();
     await this.disk.close();
+  }
+
+  // ================= transaction undo =================
+
+  /** Start undo tracking; snapshots any pages already dirty (pre-transaction state). */
+  beginUndo(): void {
+    this.undo = new Map();
+    for (const frame of this.frames.values()) {
+      if (frame.dirty) this.undo.set(frame.page.id, frame.page.data.slice());
+    }
+  }
+
+  /** Drop undo tracking (transaction committed). */
+  commitUndo(): void {
+    this.undo = null;
+  }
+
+  get undoSize(): number {
+    return this.undo?.size ?? 0;
+  }
+
+  /** Restore every page touched by the transaction, then discard tracking. */
+  async rollbackUndo(): Promise<void> {
+    const undo = this.undo;
+    this.undo = null;
+    if (!undo) return;
+    for (const [id, bytes] of undo) {
+      const page = await this.pin(id);
+      page.data.set(bytes);
+      await this.unpin(id, true);
+    }
   }
 }

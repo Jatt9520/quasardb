@@ -145,6 +145,11 @@ export class Catalog {
     return this.data;
   }
 
+  /** Replace the in-memory catalog wholesale (used by transaction rollback). */
+  restore(data: CatalogData): void {
+    this.data = data;
+  }
+
   addTable(meta: TableMeta): void {
     this.data.tables.push(meta);
   }

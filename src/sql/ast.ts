@@ -127,6 +127,18 @@ export type Expr =
 
 export type Literal = number | string | boolean | null;
 
+export interface BeginStmt {
+  kind: "begin";
+}
+
+export interface CommitStmt {
+  kind: "commit";
+}
+
+export interface RollbackStmt {
+  kind: "rollback";
+}
+
 export type Statement =
   | SelectStmt
   | SetOpStmt
@@ -136,7 +148,10 @@ export type Statement =
   | CreateTableStmt
   | CreateIndexStmt
   | DropTableStmt
-  | DropIndexStmt;
+  | DropIndexStmt
+  | BeginStmt
+  | CommitStmt
+  | RollbackStmt;
 
 export interface ParseResult {
   statement: Statement;

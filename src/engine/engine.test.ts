@@ -282,3 +282,82 @@ describe("indexes speed up equality lookups", () => {
     expect(r.rows).toEqual([["bob"]]);
   });
 });
+
+describe("transactions", () => {
+  it("rolls back INSERT, UPDATE and DELETE together", async () => {
+    await q("BEGIN");
+    await q("INSERT INTO users (name, age) VALUES ('txn1', 50)");
+    await q("UPDATE users SET age = 1 WHERE name = 'bob'");
+    await q("DELETE FROM names WHERE first = 'alice'");
+    expect((await q("SELECT COUNT(*) FROM users")).rows[0][0]).toBe(5);
+    await q("ROLLBACK");
+    expect((await q("SELECT COUNT(*) FROM users")).rows[0][0]).toBe(4);
+    expect((await q("SELECT age FROM users WHERE name = 'bob'")).rows[0][0]).toBe(25);
+    expect((await q("SELECT COUNT(*) FROM names")).rows[0][0]).toBe(4);
+    const r = await q("SELECT name FROM users WHERE age = 25");
+    expect(r.rows).toEqual([["bob"]]);
+  });
+
+  it("restores heap header (row count) even when the page was evicted", async () => {
+    const meta = engine.catalogData.tables.find((t) => t.name === "users")!;
+    await q("BEGIN");
+    await q("INSERT INTO users (name, age) VALUES ('evicted', 1)");
+    await engine.bufferPool.dropPage(meta.headerPageId);
+    expect(engine.bufferPool.undoSize).toBeGreaterThan(0);
+    await q("ROLLBACK");
+    expect((await q("SELECT COUNT(*) FROM users")).rows[0][0]).toBe(4);
+    const r = await q("SELECT name FROM users WHERE name = 'evicted'");
+    expect(r.rowCount).toBe(0);
+  });
+
+  it("rolls back DDL: CREATE TABLE and its data", async () => {
+    await q("BEGIN");
+    await q("CREATE TABLE txn_t (id INTEGER PRIMARY KEY, v TEXT)");
+    await q("INSERT INTO txn_t VALUES (1, 'x')");
+    expect(engine.catalogData.tables.some((t) => t.name === "txn_t")).toBe(true);
+    await q("ROLLBACK");
+    expect(engine.catalogData.tables.some((t) => t.name === "txn_t")).toBe(false);
+    await expect(q("SELECT * FROM txn_t")).rejects.toThrow(/not found/);
+    await expect(q("CREATE TABLE txn_t (id INTEGER)")).resolves.toBeTruthy();
+  });
+
+  it("rolls back DDL: DROP TABLE", async () => {
+    await q("BEGIN");
+    await q("DROP TABLE left_t");
+    expect(engine.catalogData.tables.some((t) => t.name === "left_t")).toBe(false);
+    await q("ROLLBACK");
+    expect(engine.catalogData.tables.some((t) => t.name === "left_t")).toBe(true);
+    const r = await q("SELECT COUNT(*) FROM left_t");
+    expect(r.rows[0][0]).toBe(3);
+  });
+
+  it("rejects wrong transaction control", async () => {
+    await expect(q("COMMIT")).rejects.toThrow(/no transaction/);
+    await expect(q("ROLLBACK")).rejects.toThrow(/no transaction/);
+    await q("BEGIN");
+    await expect(q("BEGIN")).rejects.toThrow(/already in a transaction/);
+    await q("ROLLBACK");
+    await expect(q("ROLLBACK")).rejects.toThrow(/no transaction/);
+  });
+
+  it("statement errors inside a transaction keep it open and rollable", async () => {
+    await q("BEGIN");
+    await q("INSERT INTO users (name, age) VALUES ('txn3', 1)");
+    await expect(q("INSERT INTO missing_table VALUES (1)")).rejects.toThrow(/not found/);
+    expect(engine.inTransaction).toBe(true);
+    await q("ROLLBACK");
+    expect((await q("SELECT COUNT(*) FROM users")).rows[0][0]).toBe(4);
+  });
+
+  it("commit persists across reopen", async () => {
+    await q("BEGIN");
+    await q("INSERT INTO users (name, age) VALUES ('persist', 2)");
+    const rows = await q("SELECT COUNT(*) FROM users");
+    expect(rows.rows[0][0]).toBe(5);
+    await q("COMMIT");
+    await engine.close();
+    engine = await Engine.open(join(dir, "test.db"));
+    const r = await q("SELECT name FROM users WHERE name = 'persist'");
+    expect(r.rows).toEqual([["persist"]]);
+  });
+});

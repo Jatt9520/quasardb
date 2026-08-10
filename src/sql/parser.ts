@@ -97,6 +97,33 @@ class Parser {
         return this.parseUpdate();
       case "delete":
         return this.parseDelete();
+      case "begin": {
+        this.next();
+        this.matchKeyword("transaction");
+        this.matchKeyword("work");
+        this.consumeOptionalSemicolon();
+        return { kind: "begin" };
+      }
+      case "start": {
+        this.next();
+        this.expectKeyword("transaction");
+        this.consumeOptionalSemicolon();
+        return { kind: "begin" };
+      }
+      case "commit": {
+        this.next();
+        this.matchKeyword("transaction");
+        this.matchKeyword("work");
+        this.consumeOptionalSemicolon();
+        return { kind: "commit" };
+      }
+      case "rollback": {
+        this.next();
+        this.matchKeyword("transaction");
+        this.matchKeyword("work");
+        this.consumeOptionalSemicolon();
+        return { kind: "rollback" };
+      }
       case "create": {
         this.next();
         if (this.matchKeyword("table")) return this.parseCreateTable();
