@@ -1,0 +1,26 @@
+{
+  "name": "quasardb",
+  "version": "0.1.0",
+  "description": "QuasarDB — a from-scratch relational database engine (SQL parser, optimizer, executor, storage, MVCC, WAL)",
+  "type": "module",
+  "main": "dist/engine/index.js",
+  "bin": {
+    "quasar": "dist/cli/repl.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "repl": "tsx src/cli/repl.ts",
+    "server": "tsx src/server/server.ts",
+    "bench": "tsx src/bench/bench.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
