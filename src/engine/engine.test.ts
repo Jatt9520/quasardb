@@ -303,7 +303,7 @@ describe("transactions", () => {
     await q("BEGIN");
     await q("INSERT INTO users (name, age) VALUES ('evicted', 1)");
     await engine.bufferPool.dropPage(meta.headerPageId);
-    expect(engine.bufferPool.undoSize).toBeGreaterThan(0);
+    expect(engine.bufferPool.chainLength(meta.headerPageId)).toBeGreaterThan(0);
     await q("ROLLBACK");
     expect((await q("SELECT COUNT(*) FROM users")).rows[0][0]).toBe(4);
     const r = await q("SELECT name FROM users WHERE name = 'evicted'");
@@ -359,5 +359,78 @@ describe("transactions", () => {
     engine = await Engine.open(join(dir, "test.db"));
     const r = await q("SELECT name FROM users WHERE name = 'persist'");
     expect(r.rows).toEqual([["persist"]]);
+  });
+});
+
+describe("MVCC sessions", () => {
+  // a helper that runs SQL through an isolated session of the shared engine
+  const sess = () => {
+    const s = engine.session();
+    return async (sql: string) => {
+      const p = parseStatement(sql);
+      return s.execute(p.statement, { explain: p.explain, analyze: p.analyze });
+    };
+  };
+
+  it("hides uncommitted writes from other sessions until commit", async () => {
+    await q("CREATE TABLE mvcc_t (id INTEGER PRIMARY KEY, v TEXT)");
+    const a = sess();
+    const b = sess();
+    await a("BEGIN");
+    await a("INSERT INTO mvcc_t VALUES (1, 'one')");
+    // the writer sees its own uncommitted write (heap and pk index paths)
+    expect((await a("SELECT v FROM mvcc_t WHERE id = 1")).rows).toEqual([["one"]]);
+    expect((await a("SELECT COUNT(*) FROM mvcc_t")).rows[0][0]).toBe(1);
+    // another session sees nothing, through either access path
+    expect((await b("SELECT COUNT(*) FROM mvcc_t")).rows[0][0]).toBe(0);
+    expect((await b("SELECT v FROM mvcc_t WHERE id = 1")).rowCount).toBe(0);
+    // a concurrent writer is rejected conservatively
+    await expect(b("INSERT INTO mvcc_t VALUES (2, 'two')")).rejects.toThrow(/write conflict/);
+    // commit publishes the row to everyone
+    await a("COMMIT");
+    expect((await b("SELECT * FROM mvcc_t")).rowCount).toBe(1);
+    expect((await b("INSERT INTO mvcc_t VALUES (2, 'two')")).rowCount).toBe(1);
+    await q("DROP TABLE mvcc_t");
+  });
+
+  it("rollback restores the pre-transaction state for other sessions", async () => {
+    await q("CREATE TABLE rb_t (id INTEGER PRIMARY KEY, v TEXT)");
+    await q("INSERT INTO rb_t VALUES (1, 'x')");
+    const a = sess();
+    const b = sess();
+    await a("BEGIN");
+    await a("UPDATE rb_t SET v = 'y' WHERE id = 1");
+    expect((await a("SELECT v FROM rb_t WHERE id = 1")).rows).toEqual([["y"]]);
+    // outsider still reads the old value through heap and pk index
+    expect((await b("SELECT v FROM rb_t WHERE id = 1")).rows).toEqual([["x"]]);
+    expect((await q("SELECT COUNT(*) FROM rb_t")).rows[0][0]).toBe(1);
+    await a("ROLLBACK");
+    expect((await q("SELECT v FROM rb_t WHERE id = 1")).rows).toEqual([["x"]]);
+    expect((await q("SELECT COUNT(*) FROM rb_t")).rows[0][0]).toBe(1);
+    await q("DROP TABLE rb_t");
+  });
+
+  it("autocommit write statements are atomic on error", async () => {
+    await q("CREATE TABLE at_t (id INTEGER PRIMARY KEY)");
+    await q("INSERT INTO at_t VALUES (1)");
+    await expect(q("INSERT INTO at_t VALUES (2), (1)")).rejects.toThrow(/UNIQUE/);
+    expect((await q("SELECT COUNT(*) FROM at_t")).rows[0][0]).toBe(1);
+    await q("DROP TABLE at_t");
+  });
+
+  it("commits publish to later snapshots; version chains are garbage-collected", async () => {
+    await q("CREATE TABLE gc_t (id INTEGER PRIMARY KEY, v TEXT)");
+    const a = sess();
+    await a("BEGIN");
+    await a("INSERT INTO gc_t VALUES (1, 'one')");
+    const b = sess();
+    // b's snapshot predates a's commit: still hidden
+    expect((await b("SELECT COUNT(*) FROM gc_t")).rows[0][0]).toBe(0);
+    await a("COMMIT");
+    expect((await q("SELECT COUNT(*) FROM gc_t")).rows[0][0]).toBe(1);
+    // all committed: no live chain should survive on the table pages
+    const meta = engine.catalogData.tables.find((t) => t.name === "gc_t")!;
+    expect(engine.bufferPool.chainLength(meta.headerPageId)).toBe(0);
+    await q("DROP TABLE gc_t");
   });
 });

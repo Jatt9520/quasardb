@@ -43,8 +43,8 @@ export class TableHeap {
     return this.headerPageId;
   }
 
-  private async readHeader(): Promise<{ firstPage: number; count: number; autoinc: number; ridSeq: number }> {
-    const page = await this.pool.pin(this.headerPageId);
+  private async readHeader(snap?: number): Promise<{ firstPage: number; count: number; autoinc: number; ridSeq: number }> {
+    const page = snap === undefined ? await this.pool.pin(this.headerPageId) : await this.pool.readSnapshot(this.headerPageId, snap);
     try {
       const dv = new DataView(page.data.buffer, page.data.byteOffset, page.data.byteLength);
       return {
@@ -54,7 +54,7 @@ export class TableHeap {
         ridSeq: dv.getUint32(24, true),
       };
     } finally {
-      await this.pool.unpin(this.headerPageId, false);
+      if (snap === undefined) await this.pool.unpin(this.headerPageId, false);
     }
   }
 
@@ -143,15 +143,15 @@ export class TableHeap {
     await this.writeHeader(h.firstPage, h.count + delta, h.autoinc, h.ridSeq);
   }
 
-  scan(): AsyncIterable<{ pageId: number; index: number; rid: number; record: Uint8Array; delete: () => Promise<void> }> {
+  scan(snap?: number): AsyncIterable<{ pageId: number; index: number; rid: number; record: Uint8Array; delete: () => Promise<void> }> {
     const self = this;
     return {
       async *[Symbol.asyncIterator]() {
-        const h = await self.readHeader();
+        const h = await self.readHeader(snap);
         let pid = h.firstPage;
         let rid = 0;
         while (pid !== 0) {
-          const pg = await self.pool.pin(pid);
+          const pg = snap === undefined ? await self.pool.pin(pid) : await self.pool.readSnapshot(pid, snap);
           const tp = new TablePage(pg);
           const next = tp.nextPage;
           const slots = tp.slots();
@@ -180,15 +180,15 @@ export class TableHeap {
     };
   }
 
-  async getSlot(pageId: number, index: number): Promise<Uint8Array | null> {
-    const pg = await this.pool.pin(pageId);
+  async getSlot(pageId: number, index: number, snap?: number): Promise<Uint8Array | null> {
+    const pg = snap === undefined ? await this.pool.pin(pageId) : await this.pool.readSnapshot(pageId, snap);
     try {
       const tp = new TablePage(pg);
       const slots = tp.slots();
       if (index >= slots.length) return null;
       return pg.data.slice(slots[index].offset, slots[index].offset + slots[index].length);
     } finally {
-      await this.pool.unpin(pageId, false);
+      if (snap === undefined) await this.pool.unpin(pageId, false);
     }
   }
 

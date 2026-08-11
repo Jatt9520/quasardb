@@ -82,6 +82,8 @@ export interface ExecContext {
   /** outer row context for correlated subqueries */
   outer?: import("../expr/evaluator.js").EvalContext | null;
   emitProgress?: (label: string, rowCount: number) => void;
+  /** MVCC snapshot id: when set, all reads see the snapshot-consistent state */
+  snap?: number;
 }
 
 export class ScanOperator extends BaseOperator {
@@ -113,7 +115,7 @@ export class ScanOperator extends BaseOperator {
       this.schema = schemaOf(meta.name, meta.columns);
       this.schemaNames = meta.columns.map((c) => c.name);
       this.tables = meta.columns.map(() => this.node.alias.toLowerCase());
-      this.iter = (await heap.scan())[Symbol.asyncIterator]();
+      this.iter = (await heap.scan(this.ctx.snap))[Symbol.asyncIterator]();
     }
     const res = await this.iter.next();
     if (res.done) return null;
@@ -159,9 +161,9 @@ export class IndexScanOperator extends BaseOperator {
       this.prefixLen = this.node.prefix.length;
       this.prefixValues = this.node.prefix.map((k) => k.value);
       this.singleCol = idx.columns.length === 1;
-      this.iter = idx.scanRange(this.buildBound(this.node.lo), null)[Symbol.asyncIterator]();
+      this.iter = idx.scanRange(this.buildBound(this.node.lo), null, this.ctx.snap)[Symbol.asyncIterator]();
       this.locator = new Map();
-      for await (const { pageId, index, rid } of this.heap.scan()) {
+      for await (const { pageId, index, rid } of this.heap.scan(this.ctx.snap)) {
         this.locator.set(rid, { pageId, index });
       }
     }
@@ -188,7 +190,7 @@ export class IndexScanOperator extends BaseOperator {
       }
       const loc = this.locator!.get(res.value.value);
       if (!loc) continue;
-      const record = await this.heap.getSlot(loc.pageId, loc.index);
+      const record = await this.heap.getSlot(loc.pageId, loc.index, this.ctx.snap);
       if (record === null) continue;
       const row = deserializeRow(this.schema!, record);
       this.stats.pages++;

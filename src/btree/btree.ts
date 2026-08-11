@@ -344,10 +344,10 @@ export class BtreeIndex {
     return this.metaPageId;
   }
 
-  private async readMeta(): Promise<BtreeMeta> {
-    const page = await this.pool.pin(this.metaPageId);
+  private async readMeta(snap?: number): Promise<BtreeMeta> {
+    const page = snap === undefined ? await this.pool.pin(this.metaPageId) : await this.pool.readSnapshot(this.metaPageId, snap);
     const m = new BtreeMeta(page);
-    await this.pool.unpin(this.metaPageId, false);
+    if (snap === undefined) await this.pool.unpin(this.metaPageId, false);
     return m;
   }
 
@@ -358,8 +358,8 @@ export class BtreeIndex {
     await this.pool.unpin(this.metaPageId, true);
   }
 
-  async rootPage(): Promise<number> {
-    return (await this.readMeta()).root;
+  async rootPage(snap?: number): Promise<number> {
+    return (await this.readMeta(snap)).root;
   }
 
   async size(): Promise<number> {
@@ -619,24 +619,24 @@ export class BtreeIndex {
   }
 
   // ---------------- find ----------------
-  async find(key: Uint8Array): Promise<{ found: boolean; value: number }> {
-    const root = await this.rootPage();
+  async find(key: Uint8Array, snap?: number): Promise<{ found: boolean; value: number }> {
+    const root = await this.rootPage(snap);
     if (root === 0) return { found: false, value: 0 };
     let current = root;
     for (;;) {
-      const page = await this.pool.pin(current);
+      const page = snap === undefined ? await this.pool.pin(current) : await this.pool.readSnapshot(current, snap);
       if (this.isLeaf(page)) {
         const idx = this.lowerBound(page, key);
         if (idx < this.keyCount(page) && compareKeys(this.readEntry(page, idx).key, key) === 0) {
           const v = this.readEntry(page, idx).value;
-          await this.pool.unpin(current, false);
+          if (snap === undefined) await this.pool.unpin(current, false);
           return { found: true, value: v };
         }
-        await this.pool.unpin(current, false);
+        if (snap === undefined) await this.pool.unpin(current, false);
         return { found: false, value: 0 };
       }
       const child = this.childOf(page, key);
-      await this.pool.unpin(current, false);
+      if (snap === undefined) await this.pool.unpin(current, false);
       if (child === 0) return { found: false, value: 0 };
       current = child;
     }
@@ -644,44 +644,44 @@ export class BtreeIndex {
 
   // ---------------- range scan ----------------
   /** Visit entries with key in [start, end); null = unbounded. */
-  async *scanRange(start: Uint8Array | null, end: Uint8Array | null): AsyncGenerator<BtreeEntry & { pageId: number }> {
-    const root = await this.rootPage();
+  async *scanRange(start: Uint8Array | null, end: Uint8Array | null, snap?: number): AsyncGenerator<BtreeEntry & { pageId: number }> {
+    const root = await this.rootPage(snap);
     if (root === 0) return;
-    let leafId = await this.findLeaf(root, start);
+    let leafId = await this.findLeaf(root, start, snap);
     while (leafId !== 0) {
-      const leaf = await this.pool.pin(leafId);
+      const leaf = snap === undefined ? await this.pool.pin(leafId) : await this.pool.readSnapshot(leafId, snap);
       const n = this.keyCount(leaf);
       const from = start === null ? 0 : this.lowerBound(leaf, start);
       for (let i = from; i < n; i++) {
         const e = this.readEntry(leaf, i);
         if (end !== null && compareKeys(e.key, end) >= 0) {
-          await this.pool.unpin(leafId, false);
+          if (snap === undefined) await this.pool.unpin(leafId, false);
           return;
         }
         yield { ...e, pageId: leafId };
       }
       const next = this.nextLeafOf(leaf);
-      await this.pool.unpin(leafId, false);
+      if (snap === undefined) await this.pool.unpin(leafId, false);
       leafId = next;
     }
   }
 
   /** Visit all entries ascending. */
-  async *scanAll(): AsyncGenerator<BtreeEntry & { pageId: number }> {
-    yield* this.scanRange(null, null);
+  async *scanAll(snap?: number): AsyncGenerator<BtreeEntry & { pageId: number }> {
+    yield* this.scanRange(null, null, snap);
   }
 
-  private async findLeaf(pageId: number, key: Uint8Array | null): Promise<number> {
+  private async findLeaf(pageId: number, key: Uint8Array | null, snap?: number): Promise<number> {
     for (;;) {
-      const page = await this.pool.pin(pageId);
+      const page = snap === undefined ? await this.pool.pin(pageId) : await this.pool.readSnapshot(pageId, snap);
       if (this.isLeaf(page)) {
-        await this.pool.unpin(pageId, false);
+        if (snap === undefined) await this.pool.unpin(pageId, false);
         return pageId;
       }
       // the leaf holding `key` is found by descending; for null start,
       // descend via leftmost children.
       const child = key === null ? this.leftmostChildOf(page) : this.childOf(page, key);
-      await this.pool.unpin(pageId, false);
+      if (snap === undefined) await this.pool.unpin(pageId, false);
       if (child === 0) return 0;
       pageId = child;
     }
