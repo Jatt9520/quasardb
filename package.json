@@ -11,8 +11,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "repl": "tsx src/cli/repl.ts",
-    "server": "tsx src/server/server.ts",
-    "bench": "tsx src/bench/bench.ts"
+    "server": "tsx src/server/pgWire.ts"
   },
   "engines": {
     "node": ">=20"
