@@ -92,6 +92,11 @@ export class BufferPool {
     return ++this.txnSeq;
   }
 
+  /** Continue the xid counter from the durable WAL watermark (crash recovery). */
+  setXidBase(base: number): void {
+    if (base > this.txnSeq) this.txnSeq = base;
+  }
+
   /** Allocate a snapshot id and register it (optionally reuse an existing xid). */
   takeSnapshot(xid?: number): number {
     const id = xid ?? this.nextXid();
@@ -247,6 +252,21 @@ export class BufferPool {
 
   async close(): Promise<void> {
     await this.flushAll();
+    await this.disk.close();
+  }
+
+  /**
+   * Simulate a process crash: discard every in-memory frame WITHOUT
+   * flushing, so the disk holds only what was flushed before the crash.
+   * Closes the disk so the file can be re-opened for recovery tests.
+   */
+  async simulateCrash(): Promise<void> {
+    this.frames.clear();
+    this.chains.clear();
+    this.committed.clear();
+    this.activeSnapshots.clear();
+    this.activeWriter = null;
+    this.writerPages.clear();
     await this.disk.close();
   }
 

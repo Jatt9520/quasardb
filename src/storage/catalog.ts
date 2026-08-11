@@ -20,6 +20,8 @@ export interface IndexMeta {
 export interface CatalogData {
   tables: TableMeta[];
   indexes: IndexMeta[];
+  /** WAL watermark: the highest transaction id whose data is durable. */
+  wal?: { lastTxnId: number };
 }
 
 /**
@@ -148,6 +150,15 @@ export class Catalog {
   /** Replace the in-memory catalog wholesale (used by transaction rollback). */
   restore(data: CatalogData): void {
     this.data = data;
+  }
+
+  get lastTxnId(): number {
+    return this.data.wal?.lastTxnId ?? 0;
+  }
+
+  setLastTxnId(xid: number): void {
+    if (!this.data.wal) this.data.wal = { lastTxnId: xid };
+    else this.data.wal.lastTxnId = xid;
   }
 
   addTable(meta: TableMeta): void {

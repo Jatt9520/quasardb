@@ -11,6 +11,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "repl": "tsx src/cli/repl.ts",
+    "crash-demo": "tsx src/cli/crashDemo.ts --write && tsx src/cli/crashDemo.ts --check",
     "server": "tsx src/server/pgWire.ts"
   },
   "engines": {

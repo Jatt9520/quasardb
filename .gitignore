@@ -4,4 +4,6 @@ dist/
 *.db-wal
 *.db-shm
 *.log
+*.wal
 .DS_Store
+.crash-demo/

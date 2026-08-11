@@ -58,6 +58,7 @@ export class Session {
   private async executeWrite(statement: Statement, opts: { explain?: boolean; analyze?: boolean }): Promise<QueryResult> {
     const inTxn = this.txnCatalog !== null;
     if (inTxn) {
+      await this.e.wal.appendStmt(this.writeXid!, statement);
       return this.runWrite(statement, opts, this.writeXid!);
     }
     const xid = this.e.pool.nextXid();
@@ -65,10 +66,12 @@ export class Session {
     this.readSnap = xid;
     this.e.pool.beginWrite(xid);
     const catalogBackup = JSON.parse(JSON.stringify(this.e.catalog.dataValue)) as CatalogData;
+    await this.e.wal.appendStmt(xid, statement);
     try {
       const r = await this.runWrite(statement, opts, xid);
       this.e.pool.commitXid(xid);
       this.readSnap = savedReadSnap;
+      await this.e.commit(xid);
       return r;
     } catch (err) {
       try {
@@ -132,18 +135,20 @@ export class Session {
 
   private async doCommit(): Promise<QueryResult> {
     if (!this.txnCatalog) throw new Error("no transaction in progress");
-    this.e.pool.commitXid(this.writeXid!);
-    this.e.pool.releaseSnapshot(this.writeXid!);
+    const xid = this.writeXid!;
+    this.e.pool.commitXid(xid);
+    this.e.pool.releaseSnapshot(xid);
     this.txnCatalog = null;
     this.writeXid = null;
     this.readSnap = null;
-    await this.e.syncAll();
+    await this.e.commit(xid);
     return { columns: [], rows: [], rowCount: 0, timeMs: 0 };
   }
 
   private async doRollback(): Promise<QueryResult> {
     if (!this.txnCatalog) throw new Error("no transaction in progress");
     const snapshot = this.txnCatalog;
+    const watermark = this.e.catalog.lastTxnId;
     this.txnCatalog = null;
     try {
       await this.e.pool.rollbackXid(this.writeXid!);
@@ -153,6 +158,7 @@ export class Session {
       this.readSnap = null;
     }
     this.e.catalog.restore(snapshot);
+    this.e.catalog.setLastTxnId(watermark);
     await this.e.commitCatalog();
     await this.e.syncAll();
     this.e.refreshState();
