@@ -43,6 +43,7 @@ async function main() {
       console.log("  .indexes  list indexes");
       console.log("  .stats    buffer pool stats");
       console.log("  .verify   verify index invariants");
+      console.log("  .btree    render index trees (.btree <idx> [--leaves|--stats])");
       console.log("  exit      quit");
       rl.prompt();
       return;
@@ -76,6 +77,37 @@ async function main() {
         const res = await idx.verify();
         console.log(`  index ${i.name}: ${res.ok ? "OK" : "FAILED " + res.errors.join("; ")}`);
       }
+      rl.prompt();
+      return;
+    }
+    if (trimmed === ".btree" || trimmed.startsWith(".btree ")) {
+      const { BtreeIndex } = await import("../btree/btree.js");
+      const { renderTree, renderLeafChain, renderStats } = await import("../btree/render.js");
+      const [name, flag] = trimmed.slice(".btree".length).trim().split(/\s+/);
+      if (!name) {
+        for (const i of engine.catalogData.indexes) {
+          console.log(`  ${i.name} ON ${i.table}(${i.columns.join(", ")})${i.unique ? " UNIQUE" : ""}`);
+        }
+        console.log("  usage: .btree <index> [--leaves|--stats]");
+        rl.prompt();
+        return;
+      }
+      const idxMeta = engine.catalogData.indexes.find((i) => i.name === name);
+      if (!idxMeta) {
+        console.log(`  no such index: ${name}`);
+        rl.prompt();
+        return;
+      }
+      const idx = new BtreeIndex(idxMeta.name, idxMeta.table, idxMeta.columns, idxMeta.metaPageId, engine.bufferPool, idxMeta.unique);
+      const snap = await idx.dumpTree();
+      const order = await idx.orderValue;
+      const out = flag === "--stats"
+        ? renderStats(snap, order)
+        : flag === "--leaves"
+          ? renderLeafChain(snap)
+          : renderTree(snap);
+      console.log(`index ${idxMeta.name}${idxMeta.unique ? " (unique)" : ""}:`);
+      console.log(out);
       rl.prompt();
       return;
     }

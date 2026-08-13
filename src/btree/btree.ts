@@ -137,11 +137,6 @@ export function compositeKeyToString(c: Uint8Array): string {
   return parts.join(" ");
 }
 
-function compositeTag(k: Uint8Array): number {
-  return TAG_COMPOSITE;
-}
-
-/** Compare simple (single-part) keys: used on composite part slices. */
 function compareSimple(a: Uint8Array, b: Uint8Array): number {
   if (a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
   switch (a[0]) {
@@ -191,13 +186,13 @@ function compareComposite(a: Uint8Array, b: Uint8Array): number {
 }
 
 export function compareKeys(a: Uint8Array, b: Uint8Array): number {
-  const ta = a[0] === 5 ? compositeTag(a) : a[0];
-  const tb = b[0] === 5 ? compositeTag(b) : b[0];
-  if (a[0] === 5 || b[0] === 5) {
-    // composite comparison: compare part by part
+  // A composite key is a sequence of length-prefixed typed parts; its first
+  // byte is the length prefix of part 0 (always >= 9), whereas typed keys
+  // start with a tag byte in 0..4 — so byte0 > 4 identifies composites.
+  if (a[0] > 4 || b[0] > 4) {
     return compareComposite(a, b);
   }
-  if (ta !== tb) return ta < tb ? -1 : 1;
+  if (a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
   switch (a[0]) {
     case TAG_NULL:
       return 0;
@@ -242,7 +237,7 @@ export function keyToString(k: Uint8Array): string {
     case TAG_STRING:
       return new TextDecoder().decode(k.slice(9));
     default:
-      return "?";
+      return k[0] > 4 ? compositeKeyToString(k) : "?";
   }
 }
 
@@ -298,6 +293,11 @@ interface SplitResult {
   rightNode: number;
 }
 
+interface InsertOutcome {
+  split?: SplitResult;
+  added: boolean;
+}
+
 /**
  * A B+ tree stored across disk pages.
  *   leaves:    entries (key -> row id); siblings linked by next-leaf pointer.
@@ -342,6 +342,10 @@ export class BtreeIndex {
 
   get metaPageIdValue(): number {
     return this.metaPageId;
+  }
+
+  get orderValue(): Promise<number> {
+    return this.readMeta().then((m) => m.order);
   }
 
   private async readMeta(snap?: number): Promise<BtreeMeta> {
@@ -490,7 +494,12 @@ export class BtreeIndex {
     const n = this.keyCount(page);
     if (n === 0) return this.leftmostChildOf(page);
     const idx = this.lowerBound(page, key);
-    if (idx === 0) return this.leftmostChildOf(page);
+    if (idx === 0) {
+      // key == entries[0].key routes to entries[0].value; strictly smaller
+      // keys go to leftmostChild
+      const e0 = this.readEntry(page, 0);
+      return compareKeys(e0.key, key) === 0 ? e0.value : this.leftmostChildOf(page);
+    }
     if (idx < n) {
       const e = this.readEntry(page, idx);
       if (compareKeys(e.key, key) === 0) return e.value;
@@ -515,13 +524,16 @@ export class BtreeIndex {
       });
       return true;
     }
-    const split = await this.insertRecursive(root, key, value);
-    if (split) {
+    const outcome = await this.insertRecursive(root, key, value);
+    if (outcome.added) {
+      await this.mutateMeta((m) => m.setCount(m.count + 1));
+    }
+    if (outcome.split) {
       const oldRoot = await this.rootPage();
       const newRoot = await this.pool.createPage("btree_internal");
       this.initNode(newRoot, false);
       this.setLeftmostChild(newRoot, oldRoot);
-      this.writeEntry(newRoot, 0, split.splitKey.key, split.rightNode);
+      this.writeEntry(newRoot, 0, outcome.split.splitKey.key, outcome.split.rightNode);
       this.setKeyCount(newRoot, 1);
       await this.pool.unpin(newRoot.id, true);
       await this.mutateMeta((m) => m.setRoot(newRoot.id));
@@ -529,10 +541,11 @@ export class BtreeIndex {
     return true;
   }
 
-  /** Recursive insert; returns SplitResult when this node split. */
-  private async insertRecursive(pageId: number, key: Uint8Array, value: number): Promise<SplitResult | undefined> {
+  /** Recursive insert; reports whether a new entry was added and splits. */
+  private async insertRecursive(pageId: number, key: Uint8Array, value: number): Promise<InsertOutcome> {
     const page = await this.pool.pin(pageId);
     try {
+      let added = false;
       if (this.isLeaf(page)) {
         const idx = this.lowerBound(page, key);
         if (idx < this.keyCount(page)) {
@@ -542,25 +555,27 @@ export class BtreeIndex {
               throw new Error(`UNIQUE constraint failed: duplicate key ${existing.keyText}`);
             }
             this.overwriteValue(page, idx, value);
-            return undefined;
+            return { added: false };
           }
         }
         this.insertAt(page, idx, key, value);
+        added = true;
       } else {
         const childId = this.childOf(page, key);
         if (childId === 0) throw new Error("B+ tree: internal node without children");
-        const childSplit = await this.insertRecursive(childId, key, value);
-        if (childSplit) {
-          const pos = this.lowerBound(page, childSplit.splitKey.key);
-          this.insertAt(page, pos, childSplit.splitKey.key, childSplit.rightNode);
+        const childOutcome = await this.insertRecursive(childId, key, value);
+        added = childOutcome.added;
+        if (childOutcome.split) {
+          const pos = this.lowerBound(page, childOutcome.split.splitKey.key);
+          this.insertAt(page, pos, childOutcome.split.splitKey.key, childOutcome.split.rightNode);
         }
       }
 
       const order = (await this.readMeta()).order;
       if (this.keyCount(page) > order) {
-        return await this.splitNode(page);
+        return { split: await this.splitNode(page), added };
       }
-      return undefined;
+      return { added };
     } finally {
       await this.pool.unpin(pageId, true);
     }
@@ -753,6 +768,9 @@ export class BtreeIndex {
     const byId = new Map<number, BtreeSnapshot>();
     for (const s of snap) byId.set(s.pageId, s);
     for (const s of snap) {
+      // Only internal nodes own children; leaves' `values` are row ids, not
+      // page ids, so they must never set parent pointers.
+      if (s.kind !== "internal") continue;
       if (s.leftmostChild !== 0) {
         const child = byId.get(s.leftmostChild);
         if (child) child.parent = s.pageId;
@@ -777,8 +795,8 @@ export class BtreeIndex {
 
     for (const node of snap) {
       for (let i = 1; i < node.keys.length; i++) {
-        const a = encodeTextKey(node.keys[i - 1]);
-        const b = encodeTextKey(node.keys[i]);
+        const a = encodeVerifyKey(node.keys[i - 1]);
+        const b = encodeVerifyKey(node.keys[i]);
         if (compareKeys(a, b) >= 0) {
           errors.push(`page ${node.pageId}: keys not strictly ascending at index ${i}`);
         }
@@ -812,4 +830,10 @@ export function encodeTextKey(t: string): Uint8Array {
   const n = Number(t);
   if (!Number.isNaN(n) && t.trim() !== "") return encodeKeyNumber(n);
   return encodeKeyString(t);
+}
+
+/** Re-encode a rendered key text for comparison; composite texts are split on spaces. */
+function encodeVerifyKey(t: string): Uint8Array {
+  if (t.includes(" ")) return encodeCompositeKey(t.split(" ").map(encodeTextKey));
+  return encodeTextKey(t);
 }
