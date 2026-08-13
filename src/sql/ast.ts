@@ -1,4 +1,4 @@
-export type SqlType = "int" | "bigint" | "real" | "text" | "boolean";
+export type SqlType = "int" | "bigint" | "real" | "text" | "boolean" | "vector";
 
 export interface ColumnDef {
   name: string;
@@ -115,6 +115,7 @@ export interface OrderByItem {
 
 export type Expr =
   | { kind: "literal"; value: Literal }
+  | { kind: "vector"; value: number[] }
   | { kind: "col"; table: string | null; name: string }
   | { kind: "binop"; op: string; left: Expr; right: Expr }
   | { kind: "unop"; op: string; operand: Expr }

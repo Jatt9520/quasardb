@@ -7,7 +7,7 @@ import { Value, compareValues, truthy, valueHashKey } from "../expr/value.js";
 import { containsSubquery, evalExpr, evalExprAsync, SubqueryRunner } from "../expr/evaluator.js";
 import { TableMeta } from "../storage/catalog.js";
 import { deserializeRow, Schema, schemaOf } from "../storage/record.js";
-import { AggregateNode, DistinctNode, FilterNode, IndexScanNode, JoinNode, LimitNode, PlanNode, ProjectNode, SetOpNode, SortNode, TableScanNode } from "../planner/plan.js";
+import { AggregateNode, DistinctNode, FilterNode, IndexScanNode, JoinNode, KnnNode, LimitNode, PlanNode, ProjectNode, SetOpNode, SortNode, TableScanNode } from "../planner/plan.js";
 
 // ========================= Row model =========================
 
@@ -201,8 +201,13 @@ export class IndexScanOperator extends BaseOperator {
   /** Start key for the scan: composite(prefix values..., bound) or a bare typed key. */
   private buildBound(bound: { col: string; value: Value } | null): Uint8Array | null {
     const parts: Uint8Array[] = [];
-    for (const k of this.node.prefix) parts.push(encodeTypedKey(k.value, this.colType(k.col)));
-    if (bound) parts.push(encodeTypedKey(bound.value, this.colType(bound.col)));
+    // index bounds are scalar keys; skip non-scalar (vector) values defensively
+    const pushKey = (k: { col: string; value: Value }) => {
+      if (Array.isArray(k.value)) return;
+      parts.push(encodeTypedKey(k.value as string | number | boolean | null, this.colType(k.col)));
+    };
+    for (const k of this.node.prefix) pushKey(k);
+    if (bound) pushKey(bound);
     if (parts.length === 0) return null;
     return parts.length === 1 ? parts[0] : encodeCompositeKey(parts);
   }
@@ -654,8 +659,72 @@ export class SortOperator extends BaseOperator {
   }
 }
 
-export class LimitOperator extends BaseOperator {
+/**
+ * k-nearest-neighbor scan: single pass over the child, one distance
+ * evaluation per row, top-k kept in a max-heap. Emits the k nearest
+ * rows in ascending distance order.
+ */
+export class VectorKnnOperator extends BaseOperator {
   constructor(
+    private child: Operator,
+    private node: KnnNode,
+  ) {
+    super();
+  }
+
+  private rows: Row[] | null = null;
+  private idx = 0;
+
+  async nextInner(): Promise<Row | null> {
+    if (!this.rows) {
+      const heap: { dist: number; row: Row }[] = [];
+      const k = this.node.k;
+      const push = (item: { dist: number; row: Row }) => {
+        if (heap.length < k) {
+          heap.push(item);
+          this.heapUp(heap, heap.length - 1);
+        } else if (item.dist < heap[0].dist) {
+          heap[0] = item;
+          this.heapDown(heap, 0);
+        }
+      };
+      for (;;) {
+        const r = await this.child.next();
+        if (!r) break;
+        const v = evalExpr(this.node.expr, rowContext(r));
+        push({ dist: typeof v === "number" ? v : Number.POSITIVE_INFINITY, row: r });
+      }
+      // sort ascending by distance for output
+      this.rows = heap.sort((a, b) => a.dist - b.dist).map((h) => h.row);
+    }
+    if (this.idx >= this.rows.length) return null;
+    return this.rows[this.idx++];
+  }
+
+  private heapUp(heap: { dist: number }[], i: number): void {
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (heap[parent].dist >= heap[i].dist) break;
+      [heap[parent], heap[i]] = [heap[i], heap[parent]];
+      i = parent;
+    }
+  }
+
+  private heapDown(heap: { dist: number }[], i: number): void {
+    for (;;) {
+      const l = 2 * i + 1;
+      const r = l + 1;
+      let largest = i;
+      if (l < heap.length && heap[l].dist > heap[largest].dist) largest = l;
+      if (r < heap.length && heap[r].dist > heap[largest].dist) largest = r;
+      if (largest === i) break;
+      [heap[i], heap[largest]] = [heap[largest], heap[i]];
+      i = largest;
+    }
+  }
+}
+
+export class LimitOperator extends BaseOperator {  constructor(
     private child: Operator,
     private limit: number | null,
     private offset: number,
@@ -829,6 +898,10 @@ export function buildOperator(plan: PlanNode, ctx: ExecContext): Operator {
     case "limit": {
       const p = plan as LimitNode;
       return new LimitOperator(buildOperator(p.children[0], ctx), p.limit, p.offset);
+    }
+    case "knn": {
+      const p = plan as KnnNode;
+      return new VectorKnnOperator(buildOperator(p.children[0], ctx), p);
     }
     case "distinct": {
       const p = plan as DistinctNode;

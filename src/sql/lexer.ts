@@ -25,9 +25,11 @@ const KEYWORDS = new Set([
   "boolean", "bool", "blob", "auto_increment", "explain", "analyze",
   "union", "intersect", "except", "all",
   "begin", "commit", "rollback", "start", "transaction", "work", "of",
+  "vector",
 ]);
 
 const TWO_CHAR_OPS = ["<=", ">=", "<>", "!=", "||", "::"];
+const THREE_CHAR_OPS = ["<->"];
 const SINGLE_OPS = new Set([
   "+", "-", "*", "/", "%", "=", "<", ">", "(", ")", ",", ";", ".", "[", "]",
 ]);
@@ -123,6 +125,12 @@ export class Lexer {
     if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(this.peek(1)))) return this.readNumber();
     if (c === "'" || c === '"' || c === "`") return this.readString();
 
+    for (const op of THREE_CHAR_OPS) {
+      if (this.src.startsWith(op, this.i)) {
+        this.i += 3;
+        return { type: "op", text: op, pos: this.i - 3 };
+      }
+    }
     for (const op of TWO_CHAR_OPS) {
       if (this.src.startsWith(op, this.i)) {
         this.i += 2;

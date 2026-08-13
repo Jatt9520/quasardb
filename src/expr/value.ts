@@ -1,12 +1,17 @@
 import { SqlType } from "../sql/ast.js";
 
-export type Value = number | string | boolean | null;
+export type Value = number | string | boolean | number[] | null;
 export type ColType = SqlType;
 
 export const NULL: Value = null;
 
+export function isVector(v: Value): v is number[] {
+  return Array.isArray(v);
+}
+
 export function typeName(v: Value): string {
   if (v === null) return "null";
+  if (Array.isArray(v)) return "vector";
   if (typeof v === "number") return Number.isInteger(v) ? "int" : "real";
   if (typeof v === "boolean") return "boolean";
   return "text";
@@ -14,6 +19,7 @@ export function typeName(v: Value): string {
 
 export function sqlTypeOf(v: Value): SqlType {
   if (v === null) return "text";
+  if (Array.isArray(v)) return "vector";
   if (typeof v === "number") return Number.isInteger(v) ? "int" : "real";
   if (typeof v === "boolean") return "boolean";
   return "text";
@@ -70,6 +76,14 @@ export function coerceToType(v: Value, type: SqlType): Value {
     }
     case "text":
       return String(v);
+    case "vector": {
+      if (Array.isArray(v)) return v.slice();
+      if (typeof v === "string" && v.startsWith("[") && v.endsWith("]")) {
+        const parts = v.slice(1, -1).split(",").map((s) => Number(s.trim()));
+        if (parts.every((n) => !Number.isNaN(n))) return parts;
+      }
+      throw new Error(`Cannot coerce ${JSON.stringify(v)} to VECTOR`);
+    }
   }
 }
 
@@ -115,6 +129,7 @@ export function truthy(v: Value): boolean {
 /** Stable string used for hashing / grouping keys. */
 export function valueHashKey(v: Value): string {
   if (v === null) return "\u0000N";
+  if (Array.isArray(v)) return `\u0000V[${v.join(",")}]`;
   if (typeof v === "number") return `\u0000N${v}`;
   if (typeof v === "boolean") return `\u0000B${v ? 1 : 0}`;
   return `\u0000S${v.length}\u0000${v}`;
@@ -123,6 +138,7 @@ export function valueHashKey(v: Value): string {
 /** Format a value for display (SQL-ish). */
 export function formatValue(v: Value): string {
   if (v === null) return "NULL";
+  if (Array.isArray(v)) return `[${v.map((n) => (Number.isInteger(n) ? String(n) : String(n))).join(", ")}]`;
   if (typeof v === "boolean") return v ? "true" : "false";
   if (typeof v === "number") {
     if (Number.isInteger(v) && Math.abs(v) < 1e15) return String(v);
@@ -133,6 +149,7 @@ export function formatValue(v: Value): string {
 
 export function sqlLiteral(v: Value): string {
   if (v === null) return "NULL";
+  if (Array.isArray(v)) return `[${v.join(", ")}]`;
   if (typeof v === "number") return String(v);
   if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
   return `'${v.replace(/'/g, "''")}'`;

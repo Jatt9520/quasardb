@@ -77,6 +77,17 @@ export interface LimitNode extends PlanNode {
   children: [PlanNode];
 }
 
+/** k-nearest-neighbor scan: emits the k rows closest to `query` under `expr`. */
+export interface KnnNode extends PlanNode {
+  kind: "knn";
+  /** the <-> distance expression (references the query vector literal) */
+  expr: Expr;
+  /** pre-computed query vector */
+  query: number[];
+  k: number;
+  children: [PlanNode];
+}
+
 export interface DistinctNode extends PlanNode {
   kind: "distinct";
   children: [PlanNode];
@@ -134,6 +145,11 @@ export function planToString(plan: PlanNode, indent = 0): string {
     case "limit":
       s += ` ${(plan as LimitNode).limit ?? "ALL"} OFFSET ${(plan as LimitNode).offset}`;
       break;
+    case "knn": {
+      const p = plan as KnnNode;
+      s += ` k=${p.k} BY ${exprToString(p.expr)}`;
+      break;
+    }
     case "project":
       break;
     case "setop": {
@@ -151,6 +167,8 @@ export function exprToString(e: Expr): string {
   switch (e.kind) {
     case "literal":
       return String(e.value);
+    case "vector":
+      return `[${e.value.join(", ")}]`;
     case "col":
       return e.table ? `${e.table}.${e.name}` : e.name;
     case "binop":

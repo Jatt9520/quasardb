@@ -19,6 +19,8 @@ export function evalExpr(expr: Expr, row: EvalContext, meta?: RowMetadata | null
   switch (expr.kind) {
     case "literal":
       return expr.value;
+    case "vector":
+      return expr.value.slice();
 
     case "col": {
       let v: Value;
@@ -171,6 +173,21 @@ export function evalBinOp(op: string, a: Value, b: Value): Value {
       if (ny === 0) throw new EvalError("Division by zero");
       return nx % ny;
     }
+    case "<->": {
+      if (a === null || b === null) return NULL;
+      if (!Array.isArray(a) || !Array.isArray(b)) {
+        throw new EvalError("Vector distance (<->) requires two VECTOR operands");
+      }
+      if (a.length !== b.length) {
+        throw new EvalError(`Vector distance dimension mismatch: ${a.length} vs ${b.length}`);
+      }
+      let sum = 0;
+      for (let i = 0; i < a.length; i++) {
+        const d = a[i] - b[i];
+        sum += d * d;
+      }
+      return Math.sqrt(sum);
+    }
     case "||": {
       if (a === null || b === null) return NULL;
       return String(a) + String(b);
@@ -256,6 +273,8 @@ export async function evalExprAsync(expr: Expr, row: EvalContext, sub: SubqueryR
   switch (expr.kind) {
     case "literal":
       return expr.value;
+    case "vector":
+      return expr.value.slice();
     case "col":
       return row.getColumn(expr.name, expr.table);
     case "unop": {
@@ -387,6 +406,10 @@ function castValue(v: Value, type: SqlType): Value {
     }
     case "text":
       return v === null ? null : String(v);
+    case "vector": {
+      if (Array.isArray(v)) return v.slice();
+      throw new EvalError(`Cannot cast "${String(v)}" to vector`);
+    }
   }
 }
 

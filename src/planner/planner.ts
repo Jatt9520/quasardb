@@ -2,7 +2,7 @@ import type { Expr, Literal, SelectStmt, SetOpStmt, SqlType, TableRef } from "..
 import type { Value } from "../expr/value.js";
 import { compareValues } from "../expr/value.js";
 import {
-  AggregateNode, DistinctNode, FilterNode, IndexScanNode, JoinNode, LimitNode, PlanNode,
+  AggregateNode, DistinctNode, FilterNode, IndexScanNode, JoinNode, KnnNode, LimitNode, PlanNode,
   ProjectNode, SetOpNode, SortNode, TableScanNode,
 } from "./plan.js";
 import { isAggregateCall } from "./plan.js";
@@ -81,7 +81,7 @@ export class Planner {
     } else {
       // sort before project so keys may reference non-selected / qualified columns
       if (stmt.orderBy.length > 0) {
-        root = this.buildSort(stmt, root, false);
+        root = this.tryBuildKnn(stmt, root) ?? this.buildSort(stmt, root, false);
       }
       const p = this.buildProject(stmt, root);
       this.computeOutput(p);
@@ -206,6 +206,37 @@ export class Planner {
       output: child.output,
     };
     return sort;
+  }
+
+  /**
+   * KNN fast path: `ORDER BY col <-> [q] LIMIT k` becomes a dedicated
+   * top-k scan that evaluates the distance once per row instead of a full
+   * sort. Only plain selects with a single ASC <-> key on a vector literal
+   * and a positive constant limit qualify.
+   */
+  private tryBuildKnn(stmt: SelectStmt, child: PlanNode): KnnNode | null {
+    if (stmt.groupBy.length > 0 || stmt.having || stmt.distinct) return null;
+    if (stmt.orderBy.length !== 1 || stmt.orderBy[0].desc) return null;
+    const expr = this.rewriteSortExpr(stmt, stmt.orderBy[0].expr, false);
+    if (expr.kind !== "binop" || expr.op !== "<->") return null;
+    const query = expr.kind === "binop" ? this.vectorLiteralOf(expr) : null;
+    if (!query) return null;
+    let k: number | null = null;
+    if (stmt.limit) {
+      const v = this.constEval(stmt.limit);
+      if (v !== null) k = Math.trunc(Number(v));
+    }
+    if (k === null || k <= 0) return null;
+    const knn: KnnNode = { kind: "knn", expr, query, k, children: [child], output: child.output };
+    return knn;
+  }
+
+  private vectorLiteralOf(e: { left: Expr; right: Expr }): number[] | null {
+    const left = e.left.kind === "vector" ? e.left.value : null;
+    if (left) return left.slice();
+    const right = e.right.kind === "vector" ? e.right.value : null;
+    if (right) return right.slice();
+    return null;
   }
 
   private rewriteSortExpr(stmt: SelectStmt, expr: Expr, aggregate: boolean): Expr {
@@ -720,6 +751,8 @@ function exprEq(a: Expr, b: Expr): boolean {
     }
     case "literal":
       return a.value === (b as { value: Literal }).value;
+    case "vector":
+      return a.value.length === (b as { value: number[] }).value.length && a.value.every((x, i) => x === (b as { value: number[] }).value[i]);
     case "func": {
       const f = b as { name: string; args: Expr[]; distinct?: boolean; star?: boolean };
       return (

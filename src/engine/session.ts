@@ -189,6 +189,9 @@ export class Session {
     const cols = s.columns.map((c) => ({ ...c, type: c.type as SqlType }));
     let pk = s.primaryKey;
     for (const c of cols) {
+      if (c.type === "vector" && (c.primaryKey || c.unique || (s.primaryKey && s.primaryKey === c.name))) {
+        throw new Error(`VECTOR column "${c.name}" cannot be a primary key or unique (vector keys are not supported)`);
+      }
       if (c.primaryKey) pk = c.name;
       if (pk && c.name === pk) {
         c.notNull = true;
@@ -226,6 +229,13 @@ export class Session {
     if (this.e.catalog.getIndex(s.index.toLowerCase())) {
       if (s.ifNotExists) return { columns: [], rows: [], rowCount: 0, timeMs: 0 };
       throw new Error(`Index "${s.index}" already exists`);
+    }
+    const meta = this.e.catalog.getTable(s.table.toLowerCase());
+    if (meta) {
+      for (const col of s.cols) {
+        const def = meta.columns.find((c) => c.name === col);
+        if (def?.type === "vector") throw new Error(`VECTOR column "${col}" cannot be indexed`);
+      }
     }
     await this.buildIndex(s.index, s.table, s.cols, false, this.readSnap ?? undefined);
     return { columns: [], rows: [], rowCount: 0, timeMs: performance.now() - t0 };

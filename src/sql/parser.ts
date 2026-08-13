@@ -23,6 +23,7 @@ const TYPE_NAMES: Record<string, SqlType> = {
   char: "text",
   boolean: "boolean",
   bool: "boolean",
+  vector: "vector",
 };
 
 class Parser {
@@ -637,9 +638,9 @@ class Parser {
         left = { kind: "like", expr: left, pattern, negated: false };
         continue;
       }
-      // comparison operators
+      // comparison operators (including <-> vector distance)
       const opTok = this.peek();
-      if (opTok.type === "op" && ["=", "!=", "<>", "<", "<=", ">", ">="].includes(opTok.text)) {
+      if (opTok.type === "op" && ["=", "!=", "<>", "<", "<=", ">", ">=", "<->"].includes(opTok.text)) {
         this.next();
         left = { kind: "binop", op: opTok.text, left, right: this.parseAdditive() };
         continue;
@@ -748,6 +749,32 @@ class Parser {
       const e = this.parseExpression();
       this.expectOp(")");
       return e;
+    }
+    if (t.type === "op" && t.text === "[") {
+      // vector literal: [1, 2, 3]
+      this.next();
+      const value: number[] = [];
+      if (!this.isOp("]")) {
+        for (;;) {
+          let sign = 1;
+          if (this.isOp("-")) {
+            this.next();
+            sign = -1;
+          }
+          const n = this.next();
+          if (n.type !== "number") {
+            throw new ParseError(`Expected a number in vector literal, found "${n.text || "EOF"}"`, n.pos);
+          }
+          value.push(sign * n.num!);
+          if (this.isOp(",")) {
+            this.next();
+            continue;
+          }
+          break;
+        }
+      }
+      this.expectOp("]");
+      return { kind: "vector", value };
     }
     if (t.type === "keyword") {
       const kw = t.text.toLowerCase();

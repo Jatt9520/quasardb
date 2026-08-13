@@ -59,6 +59,16 @@ export function serializeRow(schema: Schema, values: Value[]): Uint8Array {
         parts.push(len, bytes);
         break;
       }
+      case "vector": {
+        const vec = v as number[];
+        const dim = new Uint8Array(4);
+        new DataView(dim.buffer).setUint32(0, vec.length, true);
+        const body = new Uint8Array(vec.length * 8);
+        const dv = new DataView(body.buffer);
+        for (let i = 0; i < vec.length; i++) dv.setFloat64(i * 8, vec[i], true);
+        parts.push(dim, body);
+        break;
+      }
     }
   }
   const total = parts.reduce((s, p) => s + p.length, 0);
@@ -106,6 +116,16 @@ export function deserializeRow(schema: Schema, data: Uint8Array): Value[] {
         off += len;
         break;
       }
+      case "vector": {
+        const dim = new DataView(data.buffer, data.byteOffset + off, 4).getUint32(0, true);
+        off += 4;
+        const vec: number[] = new Array(dim);
+        const dv = new DataView(data.buffer, data.byteOffset + off, dim * 8);
+        for (let i = 0; i < dim; i++) vec[i] = dv.getFloat64(i * 8, true);
+        off += dim * 8;
+        out.push(vec);
+        break;
+      }
     }
   }
   return out;
@@ -147,6 +167,14 @@ function coerceToValue(v: Value, type: SqlType): Value {
       }
     case "text":
       return String(v);
+    case "vector": {
+      if (Array.isArray(v)) return v.slice();
+      if (typeof v === "string" && v.startsWith("[") && v.endsWith("]")) {
+        const parts = v.slice(1, -1).split(",").map((s) => Number(s.trim()));
+        if (parts.every((n) => !Number.isNaN(n))) return parts;
+      }
+      throw new Error(`Cannot coerce ${JSON.stringify(v)} to VECTOR`);
+    }
   }
 }
 
