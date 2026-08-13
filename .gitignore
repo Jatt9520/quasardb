@@ -7,3 +7,7 @@ dist/
 *.wal
 .DS_Store
 .crash-demo/
+.vt.err
+.wtprobe.mjs
+bis.txt
+.prof/

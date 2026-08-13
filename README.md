@@ -3,7 +3,7 @@
 A from-scratch relational database engine written in TypeScript, with zero
 runtime dependencies. QuasarDB is a learning-first implementation of the full
 database stack: SQL front end, query optimization, execution engine, page-based
-storage, B+tree indexes, and transactions — all in ~6k lines of readable code.
+storage, B+tree indexes, and transactions — all in ~7.5k lines of readable code.
 
 ## Features
 
@@ -40,11 +40,20 @@ storage, B+tree indexes, and transactions — all in ~6k lines of readable code.
 - Slotted-page table heaps with slot reuse and AUTO INCREMENT counters
   (`src/storage`)
 - Persistent catalog (schema metadata) stored in-page
+- B+tree page version chains in the buffer pool for MVCC snapshots
+- Append-only write-ahead log (JSON lines) with fsync-on-commit durability
+  and crash recovery (`src/wal`)
 
-**Transactions**
-- `BEGIN` / `COMMIT` / `ROLLBACK`
-- Snapshot-based isolation: the catalog is snapshotted and page writes are
-  tracked in an undo log, so `ROLLBACK` restores pre-transaction state
+**Transactions & durability**
+- `BEGIN` / `COMMIT` / `ROLLBACK` with per-session transactions
+- MVCC: buffer-pool page version chains give every session its own consistent
+  read snapshot; writers never block readers (`src/engine/session.ts`)
+- Write-ahead log (`<db>.wal`, JSON lines): statement records are buffered,
+  the commit marker is always fsynced — a transaction is durable once its
+  commit marker hits disk (`src/wal`)
+- Crash recovery: on open, committed transactions past the durable watermark
+  are replayed and the log is truncated (`src/engine/engine.ts#recoverWals`)
+- `npm run crash-demo` kills the process mid-commit and verifies recovery
 
 **Clients**
 - Interactive REPL (`quasar`) with `.tables`, `.indexes`, `.stats`, `.verify`
@@ -67,6 +76,9 @@ npm run repl            # or: npm run repl -- mydb.db
 
 # start the PostgreSQL-compatible server (default port 5432)
 npm run server
+
+# simulate a crash mid-commit, then verify WAL recovery restores the data
+npm run crash-demo
 ```
 
 Try it:
@@ -100,7 +112,10 @@ SQL text
                            ├─ table heap (src/storage/tableHeap.ts)
                            ├─ buffer pool (src/storage/bufferPool.ts) → disk (src/storage/disk.ts)
                            ├─ catalog (src/storage/catalog.ts)
-                           └─ B+tree indexes (src/btree/btree.ts)
+                             └─ B+tree indexes (src/btree/btree.ts)
+  plus, around the engine:
+     ├─ sessions (src/engine/session.ts) — per-session MVCC snapshots
+     └─ WAL (src/wal/wal.ts) — fsync-on-commit log + recovery replay
 ```
 
 The flow mirrors a real database:
@@ -123,9 +138,11 @@ src/
   expr/      expression evaluation, value coercion & comparison
   planner/   query planning, physical plan nodes
   executor/  operator execution
-  engine/    Engine API (execute, transactions, DDL/DML), integration tests
+  engine/    Engine API (execute, transactions, MVCC sessions, WAL recovery,
+             DDL/DML), integration tests
   storage/   pages, disk, buffer pool, table heap, catalog, record (de)serialization
   btree/     B+tree index implementation
+  wal/       write-ahead log with commit-fsync durability
   cli/       REPL
   server/    PostgreSQL wire protocol server
 ```
@@ -133,14 +150,17 @@ src/
 ## Testing
 
 ```bash
-npm test        # vitest runs engine.test.ts and pgWire.test.ts
+npm test        # vitest runs the engine integration suite (engine.test.ts),
+                # WAL tests (wal.test.ts), and the B+tree test suite
+                # (delta1-5, insertOnly, bisect, copyTest, render)
 ```
 
 ## Status / roadmap
 
-- [x] Core engine: SQL, storage, indexes, transactions, REPL, wire server
-- [ ] Write-ahead log (WAL) for crash-safe durability
-- [ ] True multi-version concurrency control (MVCC) / concurrent sessions
+- [x] Core engine: SQL, storage, indexes, REPL, wire server
+- [x] MVCC: per-session snapshot isolation via buffer-pool page version chains
+- [x] Write-ahead log (WAL) for crash-safe durability, with recovery replay
+      and a crash demo
 - [ ] Cost-based optimizer; hash / sort-merge joins
 - [ ] `LIKE` / range index ranges for non-equality predicates
 - [ ] Extended query protocol (Parse/Bind/Execute) in the wire server
