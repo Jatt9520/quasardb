@@ -75,6 +75,8 @@ export interface SelectStmt {
   orderBy: OrderByItem[];
   limit: Expr | null;
   offset: Expr | null;
+  /** Time-travel target: read as of this committed transaction id. */
+  asOf?: number;
 }
 
 export interface SetOpStmt {
@@ -86,6 +88,8 @@ export interface SetOpStmt {
   orderBy: OrderByItem[];
   limit: Expr | null;
   offset: Expr | null;
+  /** Time-travel target: read as of this committed transaction id. */
+  asOf?: number;
 }
 
 export type SubqueryStmt = SelectStmt | SetOpStmt;

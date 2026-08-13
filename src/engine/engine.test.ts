@@ -418,7 +418,7 @@ describe("MVCC sessions", () => {
     await q("DROP TABLE at_t");
   });
 
-  it("commits publish to later snapshots; version chains are garbage-collected", async () => {
+  it("commits publish to later snapshots; chains retained for time travel", async () => {
     await q("CREATE TABLE gc_t (id INTEGER PRIMARY KEY, v TEXT)");
     const a = sess();
     await a("BEGIN");
@@ -428,9 +428,9 @@ describe("MVCC sessions", () => {
     expect((await b("SELECT COUNT(*) FROM gc_t")).rows[0][0]).toBe(0);
     await a("COMMIT");
     expect((await q("SELECT COUNT(*) FROM gc_t")).rows[0][0]).toBe(1);
-    // all committed: no live chain should survive on the table pages
+    // the commit is inside the time-travel window, so its chain survives
     const meta = engine.catalogData.tables.find((t) => t.name === "gc_t")!;
-    expect(engine.bufferPool.chainLength(meta.headerPageId)).toBe(0);
+    expect(engine.bufferPool.chainLength(meta.headerPageId)).toBeGreaterThan(0);
     await q("DROP TABLE gc_t");
   });
 });

@@ -87,6 +87,18 @@ export class Session {
 
   /** Read statements: run against a snapshot taken at statement start. */
   private async executeRead(statement: Statement, opts: { explain?: boolean; analyze?: boolean }): Promise<QueryResult> {
+    const asOf = (statement as SelectStmt | SetOpStmt).asOf;
+    if (asOf !== undefined) {
+      // Time travel: read as of a previously committed transaction id.
+      if (!this.e.pool.committedXids.has(asOf)) {
+        throw new Error(`AS OF ${asOf}: transaction not committed in this process`);
+      }
+      const window = this.e.timeTravelWindow;
+      if (asOf < window.oldest) {
+        throw new Error(`AS OF ${asOf}: outside the time-travel window (oldest retained commit: ${window.oldest})`);
+      }
+      return this.runRead(statement, opts, asOf);
+    }
     if (this.txnCatalog) {
       return this.runRead(statement, opts, this.readSnap!);
     }

@@ -45,6 +45,11 @@ class Parser {
     return this.peek().type === "keyword" && this.peek().text.toLowerCase() === kw;
   }
 
+  private peekKeywordAt(offset: number, kw: string): boolean {
+    const t = this.tokens[this.i + offset];
+    return !!t && t.type === "keyword" && t.text.toLowerCase() === kw;
+  }
+
   private isOp(op: string): boolean {
     return this.peek().type === "op" && this.peek().text === op;
   }
@@ -377,15 +382,29 @@ class Parser {
     if (this.matchKeyword("limit")) limit = this.parseExpression();
     let offset: Expr | null = null;
     if (this.matchKeyword("offset")) offset = this.parseExpression();
+    let asOf: number | undefined;
+    if (this.matchKeyword("as")) {
+      this.expectKeyword("of");
+      const t = this.next();
+      if (t.type !== "number" || t.num === undefined) {
+        throw new ParseError(`Expected an integer transaction id after AS OF, found "${t.text || "EOF"}"`, t.pos);
+      }
+      if (!Number.isInteger(t.num)) {
+        throw new ParseError(`AS OF requires an integer transaction id, found ${t.num}`, t.pos);
+      }
+      asOf = t.num;
+    }
     if (root.kind === "setop") {
       root.orderBy = orderBy;
       root.limit = limit;
       root.offset = offset;
+      root.asOf = asOf;
       return root;
     }
     root.orderBy = orderBy;
     root.limit = limit;
     root.offset = offset;
+    root.asOf = asOf;
     return root;
   }
 
@@ -485,7 +504,9 @@ class Parser {
     }
     const table = this.expectIdent("table name");
     let alias: string | null = null;
-    if (this.matchKeyword("as")) {
+    // "AS OF <xid>" (time travel) must not be mistaken for an alias
+    if (this.peekKeywordAt(0, "as") && !this.peekKeywordAt(1, "of")) {
+      this.next();
       alias = this.expectIdent("alias");
     } else if (this.peek().type === "ident" && !this.isKeyword("on") && !this.isKeyword("join") &&
       !this.isKeyword("where") && !this.isKeyword("group") && !this.isKeyword("order") &&

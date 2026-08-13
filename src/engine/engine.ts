@@ -176,9 +176,34 @@ export class Engine {
     await this.wal.appendCommit(xid);
     if (this.onCommitMarker) await this.onCommitMarker();
     this.catalog.setLastTxnId(xid);
+    this.retainTimeTravelSnapshot(xid);
     await this.pool.flushAll();
     await this.catalog.persist();
     await this.pool.flushAll();
+  }
+
+  /** Number of most-recent commits kept readable via `SELECT ... AS OF <xid>`. */
+  timeTravelDepth = 64;
+
+  /** Committed xids pinned as active snapshots so their pre-images survive GC. */
+  private historySnapshots: number[] = [];
+
+  private retainTimeTravelSnapshot(xid: number): void {
+    this.pool.takeSnapshot(xid);
+    this.historySnapshots.push(xid);
+    while (this.historySnapshots.length > this.timeTravelDepth) {
+      const oldest = this.historySnapshots.shift()!;
+      this.pool.releaseSnapshot(oldest);
+    }
+  }
+
+  /** Range of transaction ids currently reachable via AS OF. */
+  get timeTravelWindow(): { oldest: number; newest: number; depth: number } {
+    return {
+      oldest: this.historySnapshots[0] ?? -1,
+      newest: this.historySnapshots[this.historySnapshots.length - 1] ?? -1,
+      depth: this.timeTravelDepth,
+    };
   }
 
   /** Abort the process without flushing (test/demo hook). */

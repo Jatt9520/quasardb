@@ -24,7 +24,7 @@ const KEYWORDS = new Set([
   "int", "integer", "bigint", "real", "double", "text", "varchar",
   "boolean", "bool", "blob", "auto_increment", "explain", "analyze",
   "union", "intersect", "except", "all",
-  "begin", "commit", "rollback", "start", "transaction", "work",
+  "begin", "commit", "rollback", "start", "transaction", "work", "of",
 ]);
 
 const TWO_CHAR_OPS = ["<=", ">=", "<>", "!=", "||", "::"];

@@ -19,7 +19,8 @@ export interface Frame {
  *
  * Visibility rule for a snapshot `S`:
  *   - visible = LIVE  iff  S >= head.xnid AND (head.xnid committed OR S == head.xnid)
- *   - else visible = data of the first node (from the head down) with xnid > S
+ *   - else visible = data of the oldest node with xnid > S (its pre-image is
+ *     the page state after every write with xid <= S)
  *   - else (no such node) visible = head.data
  *
  * At most ONE node per chain can be uncommitted, and it is always the head:
@@ -281,7 +282,10 @@ export class BufferPool {
         const live = await this.readLive(pageId);
         return live ? { id: pageId, type: live.type, data: live.data.slice() } : this.emptyPage(pageId);
       }
-      for (let i = arr.length - 1; i >= 0; i--) {
+      // the state as of `snap` is the pre-image of the OLDEST write newer
+      // than snap (chains are ordered oldest first); scanning from the head
+      // would pick the newest pre-image and leak later writes.
+      for (let i = 0; i < arr.length; i++) {
         if (arr[i].xnid > snap) {
           return { id: pageId, type: "free", data: arr[i].data.slice() };
         }
